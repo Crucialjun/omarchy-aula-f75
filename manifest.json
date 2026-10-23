@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "crucialjun.aula-f75",
+  "name": "AULA F75",
+  "version": "1.0.0",
+  "author": "crucialjun",
+  "license": "MIT",
+  "description": "Lighting, colour, sleep and debounce control for the AULA F75 keyboard over USB or the 2.4 GHz dongle, with optional theme-accent sync",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AULA F75",
+    "description": "Keyboard lighting popup for the AULA F75",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "themeSync": false,
+      "hideWhenDisconnected": true,
+      "showHiddenEffects": false,
+      "pollSeconds": 10
+    },
+    "schema": [
+      { "key": "themeSync", "type": "boolean", "label": "Theme sync", "defaultValue": false, "description": "Re-colour the keyboard whenever the Omarchy theme accent changes." },
+      { "key": "hideWhenDisconnected", "type": "boolean", "label": "Hide when disconnected", "defaultValue": true, "description": "Hide the bar icon while no F75 is plugged in." },
+      { "key": "showHiddenEffects", "type": "boolean", "label": "Show hidden effects", "defaultValue": false, "description": "Offer the three effects the vendor driver masks for the F75 (Shadow disappear, Retinue scanning, Rotating storm)." },
+      { "key": "pollSeconds", "type": "integer", "label": "Hot-plug poll (seconds)", "min": 2, "max": 120, "step": 1, "defaultValue": 10 }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+# AULA F75 keyboard (wired) and its 2.4 GHz dongle: let the logged-in user talk
+# to the vendor HID interface. Installed by the Omarchy AULA F75 plugin.
+KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"

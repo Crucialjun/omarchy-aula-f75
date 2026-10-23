@@ -1,0 +1,1149 @@
+#!/usr/bin/python3
+"""aula-f75 - control an AULA F75 keyboard from Linux without the vendor driver.
+
+Protocol reverse engineered from the vendor's Windows driver (OemDrv.exe,
+"AULA F75 Setup v2.0 20260514", class CDevG5KB) plus USB captures.
+See docs/PROTOCOL.md for the byte-level reference and evidence.
+
+Wired (258a:010c) is the primary, well-understood path: 520-byte HID feature
+reports (report ID 6) on the vendor interface (usage page 0xFF00).
+Wireless (2.4 GHz dongle 3554:fa09) is best-effort: 20-byte output reports
+(report ID 0x13) carrying the same data blocks in 14-byte pages.
+
+Only the Python standard library is used (hidraw ioctls through fcntl), so
+it runs on a stock Omarchy / Arch install.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import select
+import sys
+import time
+
+try:
+    import fcntl  # Linux only; the pure protocol helpers still import elsewhere (tests)
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+__version__ = "1.0.0"
+
+# --------------------------------------------------------------------------
+# Device identity (from KB.ini in the vendor package)
+# --------------------------------------------------------------------------
+WIRED_VID, WIRED_PID = 0x258A, 0x010C
+WIRELESS_VID, WIRELESS_PID = 0x3554, 0xFA09
+
+# --------------------------------------------------------------------------
+# Wired transport (CDevG5KB): 520-byte feature report, ID 6
+# --------------------------------------------------------------------------
+WIRED_REPORT_ID = 0x06
+WIRED_REPORT_LEN = 0x208          # 520 bytes including the report ID byte
+WIRED_CHUNK = 0x200               # 512 payload bytes per packet
+WIRED_PACKET_DELAY = 0.020        # the driver sleeps ~20 ms before each packet
+
+CMD_MATRIX = 0x03      # key matrix, sub = layer (0 base, 1 Fn)
+CMD_LED = 0x04         # lighting / settings block, 128 bytes
+CMD_MACRO = 0x05       # macro buffer
+CMD_PERKEY = 0x06      # per-key colours, 3 bytes per LED (matrix index)
+CMD_RGB_TABLE = 0x0A   # effect colour table, 512 bytes
+CMD_RESET = 0x11       # reset device (1 data byte)
+CMD_READ = 0x80        # OR-ed into a command to read instead of write
+
+LED_BLOCK_LEN = 0x80
+RGB_TABLE_LEN = 0x200
+PERKEY_LEDS = 126
+PERKEY_LEN = PERKEY_LEDS * 3      # 0x17A, matches the vendor capture
+MATRIX_LEN = 128                  # entries of 4 bytes, from KB.ini MatrixLen
+SIGNATURE = b"\x5a\xa5"
+
+# LED block offsets (see docs/PROTOCOL.md for the evidence behind each)
+OFF_DEBOUNCE = 0x03
+OFF_CUSTOM_FLAG = 0x09
+OFF_EFFECT = 0x0A
+OFF_SLEEP = 0x18
+OFF_EFFECT_TABLE = 0x38           # 2 bytes per effect id: brightness, speed<<4|colour
+OFF_LED_SIG = 0x7E
+OFF_RGB_SIG = 0x1FA
+RGB_SLOT_LEN = 21                 # 7 colours x RGB per effect
+COLOUR_RANDOM = 7                 # colour index meaning "colourful"/random
+
+# --------------------------------------------------------------------------
+# Wireless transport (2.4 GHz dongle): 20-byte output report, ID 0x13
+# --------------------------------------------------------------------------
+WL_REPORT_ID = 0x13
+WL_FRAME_LEN = 20
+WL_PAGE = 14
+WL_CMD_LED = 0x04
+WL_CMD_RGB_TABLE = 0x09
+WL_CMD_READ_LED = 0x44
+WL_FRAME_DELAY = 0.025
+WL_PRE_LED_DELAY = 0.17           # the vendor driver pauses ~170 ms before the LED pages
+
+# --------------------------------------------------------------------------
+# Effects: id = the byte written to the LED block, names from text.xml.
+# LedMask=0x22100 in KB.ini hides ids 9, 14 and 18 in the vendor UI for the
+# F75; they are kept here but flagged, so you can try them at your own risk.
+# --------------------------------------------------------------------------
+EFFECTS = [
+    # id, name, has_speed, has_colour, hidden_by_vendor
+    (0, "Off", False, False, False),
+    (1, "Fixed on", False, True, False),
+    (2, "Respire", True, True, False),
+    (3, "Rainbow", True, False, False),
+    (4, "Flash away", True, True, False),
+    (5, "Raindrops", True, True, False),
+    (6, "Rainbow wheel", True, True, False),
+    (7, "Ripples shining", True, True, False),
+    (8, "Stars twinkle", True, True, False),
+    (9, "Shadow disappear", True, True, True),
+    (10, "Retro snake", True, True, False),
+    (11, "Neon stream", True, True, False),
+    (12, "Reaction", True, True, False),
+    (13, "Sine wave", True, True, False),
+    (14, "Retinue scanning", True, True, True),
+    (15, "Rotating windmill", True, False, False),
+    (16, "Colorful waterfall", True, False, False),
+    (17, "Blossoming", True, False, False),
+    (18, "Rotating storm", True, True, True),
+    (21, "Custom (per-key)", False, False, False),
+]
+EFFECT_BY_ID = {e[0]: e for e in EFFECTS}
+EFFECT_CUSTOM = 21
+BRIGHTNESS_MAX = 9
+SPEED_MAX = 4
+
+# Sleep timer: the LED block stores SleepHW; the vendor UI maps it to seconds
+# (SleepUI). Unit is 30 s.
+SLEEP_UI_TO_HW = {60: 2, 90: 3, 120: 4, 180: 6, 240: 8, 300: 10, 600: 20, 900: 30, 1200: 40}
+
+# Default 7-colour palette the vendor writes for every effect slot.
+DEFAULT_PALETTE = [
+    (0xFF, 0x00, 0x00), (0x00, 0xFF, 0x00), (0x00, 0x00, 0xFF), (0xFF, 0xFF, 0x00),
+    (0xFF, 0x00, 0xFF), (0x00, 0xFF, 0xFF), (0xFF, 0xFF, 0xFF),
+]
+
+# A LED block captured from a real F75 (vendor driver, "Fixed on"). Used as a
+# template when the keyboard cannot be read (wireless fallback) and for tests.
+TEMPLATE_LED_BLOCK = bytes.fromhex(
+    "00 03 03 01 00 00 04 04 07 00 01 20 01 00 00 00 00 00 02 00 02 01 00 ff 0a 00 00 01 01 00 03 01"
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ff ff 09 40 09 47 09 47"
+    "09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47 09 47"
+    "09 37 07 47 07 47 07 44 07 44 07 44 07 44 07 44 07 44 07 44 04 09 04 04 04 04 04 04 04 04 5a a5"
+)
+
+# Key name -> matrix / LED index, from the vendor's KB.ini for this model.
+KEY_INDEX = {
+    "ESC": 0, "F1": 12, "F2": 18, "F3": 24, "F4": 30, "F5": 36, "F6": 42, "F7": 48, "F8": 54,
+    "F9": 60, "F10": 66, "F11": 72, "F12": 78, "END": 88,
+    "GRAVE": 1, "1": 7, "2": 13, "3": 19, "4": 25, "5": 31, "6": 37, "7": 43, "8": 49, "9": 55,
+    "0": 61, "MINUS": 67, "EQUAL": 73, "BACKSPACE": 79, "DELETE": 85,
+    "TAB": 2, "Q": 8, "W": 14, "E": 20, "R": 26, "T": 32, "Y": 38, "U": 44, "I": 50, "O": 56,
+    "P": 62, "LBRACKET": 68, "RBRACKET": 74, "ENTER": 81, "PGUP": 86,
+    "CAPS": 3, "A": 9, "S": 15, "D": 21, "F": 27, "G": 33, "H": 39, "J": 45, "K": 51, "L": 57,
+    "SEMICOLON": 63, "QUOTE": 69, "BACKSLASH": 75, "PGDN": 87,
+    "LSHIFT": 4, "Z": 10, "X": 16, "C": 22, "V": 28, "B": 34, "N": 40, "M": 46, "COMMA": 52,
+    "PERIOD": 58, "SLASH": 64, "RSHIFT": 70, "UP": 82,
+    "LCTRL": 5, "LWIN": 11, "LALT": 17, "SPACE": 35, "RALT": 53, "FN": 59, "ISO": 76,
+    "LEFT": 77, "DOWN": 83, "RIGHT": 89, "KNOB": 84,
+}
+KEY_ALIASES = {
+    "ESCAPE": "ESC", "`": "GRAVE", "-": "MINUS", "=": "EQUAL", "BKSP": "BACKSPACE", "DEL": "DELETE",
+    "[": "LBRACKET", "]": "RBRACKET", "RETURN": "ENTER", "PAGEUP": "PGUP", "PAGEDOWN": "PGDN",
+    "CAPSLOCK": "CAPS", ";": "SEMICOLON", "'": "QUOTE", "\\": "BACKSLASH", ",": "COMMA",
+    ".": "PERIOD", "/": "SLASH", "CTRL": "LCTRL", "WIN": "LWIN", "SUPER": "LWIN", "ALT": "LALT",
+    "ALTGR": "RALT", "LESS": "ISO", "WHEEL": "KNOB", "ESCAPEKEY": "ESC",
+}
+# Physical rows (left to right) for gradients and the per-key JSON helper.
+KEY_ROWS = [
+    ["ESC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "KNOB"],
+    ["GRAVE", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "MINUS", "EQUAL", "BACKSPACE", "DELETE"],
+    ["TAB", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "LBRACKET", "RBRACKET", "ENTER", "PGUP"],
+    ["CAPS", "A", "S", "D", "F", "G", "H", "J", "K", "L", "SEMICOLON", "QUOTE", "BACKSLASH", "PGDN"],
+    ["LSHIFT", "ISO", "Z", "X", "C", "V", "B", "N", "M", "COMMA", "PERIOD", "SLASH", "RSHIFT", "UP", "END"],
+    ["LCTRL", "LWIN", "LALT", "SPACE", "RALT", "FN", "LEFT", "DOWN", "RIGHT"],
+]
+
+
+class DeviceError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# hidraw helpers
+# --------------------------------------------------------------------------
+def _ioc(dir_, type_, nr, size):
+    return (dir_ << 30) | (size << 16) | (ord(type_) << 8) | nr
+
+
+def HIDIOCSFEATURE(length):
+    return _ioc(3, "H", 0x06, length)
+
+
+def HIDIOCGFEATURE(length):
+    return _ioc(3, "H", 0x07, length)
+
+
+def _read_sysfs(path, default=""):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return default if isinstance(default, bytes) else default.encode()
+
+
+def enumerate_devices():
+    """Return candidate hidraw nodes with vendor-interface detection.
+
+    Each entry: {path, vid, pid, name, transport, vendor_iface}
+    """
+    found = []
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        uevent = _read_sysfs(node + "/device/uevent").decode(errors="replace")
+        info = dict(line.split("=", 1) for line in uevent.splitlines() if "=" in line)
+        hid_id = info.get("HID_ID", "")
+        parts = hid_id.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            vid, pid = int(parts[1], 16), int(parts[2], 16)
+        except ValueError:
+            continue
+        if (vid, pid) == (WIRED_VID, WIRED_PID):
+            transport = "wired"
+        elif (vid, pid) == (WIRELESS_VID, WIRELESS_PID):
+            transport = "wireless"
+        else:
+            continue
+        desc = _read_sysfs(node + "/device/report_descriptor", b"")
+        if transport == "wired":
+            # Usage Page 0xFF00 (06 00 ff) and Report ID 6 (85 06)
+            vendor = b"\x06\x00\xff" in desc and b"\x85\x06" in desc
+        else:
+            # Usage Page 0xFF02 (06 02 ff) and Report ID 0x13 (85 13)
+            vendor = b"\x06\x02\xff" in desc and b"\x85\x13" in desc
+        found.append({
+            "path": "/dev/" + os.path.basename(node),
+            "vid": vid, "pid": pid,
+            "name": info.get("HID_NAME", "").strip(),
+            "transport": transport,
+            "vendor_iface": vendor,
+        })
+    return found
+
+
+def pick_device(prefer=None, explicit=None):
+    devs = enumerate_devices()
+    if explicit:
+        for d in devs:
+            if d["path"] == explicit:
+                return d
+        return {"path": explicit, "vid": 0, "pid": 0, "name": "", "transport": prefer or "wired", "vendor_iface": True}
+    order = ["wired", "wireless"] if prefer != "wireless" else ["wireless", "wired"]
+    for t in order:
+        for d in devs:
+            if d["transport"] == t and d["vendor_iface"]:
+                return d
+    return None
+
+
+# --------------------------------------------------------------------------
+# Pure protocol functions (no I/O) - unit tested in tests/test_protocol.py
+# --------------------------------------------------------------------------
+def wired_header(cmd, sub, total, idx, size):
+    return bytes([WIRED_REPORT_ID, cmd & 0xFF, sub & 0xFF, 0, total & 0xFF, idx & 0xFF, size & 0xFF, (size >> 8) & 0xFF])
+
+
+def wired_write_packets(cmd, sub, data):
+    data = bytes(data)
+    total = max(1, (len(data) + WIRED_CHUNK - 1) // WIRED_CHUNK)
+    out = []
+    for i in range(total):
+        part = data[i * WIRED_CHUNK:(i + 1) * WIRED_CHUNK]
+        pkt = bytearray(WIRED_REPORT_LEN)
+        pkt[:8] = wired_header(cmd, sub, total, i, len(part))
+        pkt[8:8 + len(part)] = part
+        out.append(bytes(pkt))
+    return out
+
+
+def wired_read_request(cmd, sub, total, idx, size):
+    pkt = bytearray(WIRED_REPORT_LEN)
+    pkt[:8] = wired_header(cmd | CMD_READ, sub, total, idx, size)
+    return bytes(pkt)
+
+
+def wl_checksum(frame19):
+    return sum(frame19[:19]) & 0xFF
+
+
+def wl_frame(cmd, total, idx, payload):
+    payload = bytes(payload)
+    if len(payload) > WL_PAGE:
+        raise ValueError("wireless page too long")
+    f = bytearray(WL_FRAME_LEN)
+    f[0] = WL_REPORT_ID
+    f[1] = cmd & 0xFF
+    f[2] = total & 0xFF
+    f[3] = idx & 0xFF
+    f[4] = len(payload)
+    f[5:5 + len(payload)] = payload
+    f[19] = wl_checksum(f)
+    return bytes(f)
+
+
+def wl_pages(cmd, data):
+    data = bytes(data)
+    total = max(1, (len(data) + WL_PAGE - 1) // WL_PAGE)
+    return [wl_frame(cmd, total, i, data[i * WL_PAGE:(i + 1) * WL_PAGE]) for i in range(total)]
+
+
+def wl_read_request(cmd):
+    return wl_frame(cmd, 1, 0, b"")
+
+
+def check_signature(buf, at):
+    return bytes(buf[at:at + 2]) == SIGNATURE
+
+
+def decode_led_block(block):
+    block = bytes(block)
+    if len(block) < LED_BLOCK_LEN:
+        raise DeviceError("LED block too short (%d bytes)" % len(block))
+    effect = block[OFF_EFFECT]
+    off = OFF_EFFECT_TABLE + 2 * effect
+    bright = block[off] if off + 1 < LED_BLOCK_LEN else 0
+    sc = block[off + 1] if off + 1 < LED_BLOCK_LEN else 0
+    speed = (sc >> 4) & 0x0F
+    colour_idx = sc & 0x0F
+    sleep_hw = block[OFF_SLEEP]
+    e = EFFECT_BY_ID.get(effect)
+    return {
+        "effect": effect,
+        "effect_name": e[1] if e else "Unknown (%d)" % effect,
+        "has_speed": bool(e and e[2]),
+        "has_colour": bool(e and e[3]),
+        "brightness": bright,
+        "speed": speed,
+        "colour_index": colour_idx,
+        "colorful": colour_idx == COLOUR_RANDOM,
+        "sleep_hw": sleep_hw,
+        "sleep_minutes": round(sleep_hw * 30 / 60, 1) if sleep_hw else 0,
+        "debounce": block[OFF_DEBOUNCE],
+        "custom_flag": block[OFF_CUSTOM_FLAG],
+        "signature_ok": check_signature(block, OFF_LED_SIG),
+    }
+
+
+def patch_led_block(block, effect=None, brightness=None, speed=None, colour_index=None,
+                    sleep_hw=None, debounce=None):
+    out = bytearray(block)
+    if effect is not None:
+        if effect not in EFFECT_BY_ID:
+            raise DeviceError("unknown effect id %d" % effect)
+        out[OFF_EFFECT] = effect
+        out[OFF_CUSTOM_FLAG] = 1 if effect == EFFECT_CUSTOM else 0
+    eff = out[OFF_EFFECT]
+    off = OFF_EFFECT_TABLE + 2 * eff
+    if brightness is not None:
+        if not 0 <= brightness <= BRIGHTNESS_MAX:
+            raise DeviceError("brightness must be 0..%d" % BRIGHTNESS_MAX)
+        out[off] = brightness
+    if speed is not None or colour_index is not None:
+        cur = out[off + 1]
+        s = (cur >> 4) & 0x0F if speed is None else speed
+        c = cur & 0x0F if colour_index is None else colour_index
+        if not 0 <= s <= SPEED_MAX:
+            raise DeviceError("speed must be 0..%d" % SPEED_MAX)
+        if not 0 <= c <= COLOUR_RANDOM:
+            raise DeviceError("colour index must be 0..7")
+        out[off + 1] = (s << 4) | c
+    if sleep_hw is not None:
+        if not 0 <= sleep_hw <= 255:
+            raise DeviceError("sleep out of range")
+        out[OFF_SLEEP] = sleep_hw
+    if debounce is not None:
+        if not 1 <= debounce <= 4:
+            raise DeviceError("debounce must be 1..4")
+        out[OFF_DEBOUNCE] = debounce
+    out[OFF_LED_SIG:OFF_LED_SIG + 2] = SIGNATURE
+    return bytes(out)
+
+
+def rgb_slot_offset(effect, colour_index=0):
+    return RGB_SLOT_LEN * effect + 3 * colour_index
+
+
+def patch_rgb_table(table, effect, colour_index, rgb):
+    out = bytearray(table)
+    off = rgb_slot_offset(effect, colour_index)
+    if off + 3 > OFF_RGB_SIG:
+        raise DeviceError("colour slot out of range")
+    out[off:off + 3] = bytes(rgb)
+    out[OFF_RGB_SIG:OFF_RGB_SIG + 2] = SIGNATURE
+    return bytes(out)
+
+
+def read_rgb_slot(table, effect, colour_index):
+    off = rgb_slot_offset(effect, colour_index)
+    return tuple(table[off:off + 3])
+
+
+def default_rgb_table():
+    t = bytearray(RGB_TABLE_LEN)
+    for e in range(1, 24):
+        for k, c in enumerate(DEFAULT_PALETTE):
+            off = rgb_slot_offset(e, k)
+            if off + 3 <= OFF_RGB_SIG:
+                t[off:off + 3] = bytes(c)
+    t[OFF_RGB_SIG:OFF_RGB_SIG + 2] = SIGNATURE
+    return bytes(t)
+
+
+def parse_colour(text):
+    s = text.strip().lstrip("#")
+    if len(s) == 8:          # QML gives #AARRGGBB
+        s = s[2:]
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    if len(s) != 6:
+        raise DeviceError("colour must be #rrggbb, got %r" % text)
+    try:
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        raise DeviceError("colour must be #rrggbb, got %r" % text)
+
+
+def colour_hex(rgb):
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def key_index(name):
+    n = name.strip().upper()
+    n = KEY_ALIASES.get(n, n)
+    if n not in KEY_INDEX:
+        raise DeviceError("unknown key %r (see 'aula-f75 keys')" % name)
+    return KEY_INDEX[n]
+
+
+def sleep_hw_from_minutes(minutes):
+    if minutes is None:
+        return None
+    if isinstance(minutes, str):
+        if minutes.lower() in ("off", "never", "0"):
+            return 0
+        minutes = float(minutes)
+    if minutes <= 0:
+        return 0
+    seconds = int(round(minutes * 60))
+    if seconds in SLEEP_UI_TO_HW:
+        return SLEEP_UI_TO_HW[seconds]
+    return max(1, min(255, int(round(seconds / 30))))
+
+
+def parse_effect(text):
+    t = text.strip().lower()
+    if t.isdigit():
+        i = int(t)
+        if i in EFFECT_BY_ID:
+            return i
+        raise DeviceError("unknown effect id %d" % i)
+    norm = t.replace("-", " ").replace("_", " ")
+    for eid, name, *_ in EFFECTS:
+        n = name.lower().replace("-", " ").replace("(", "").replace(")", "")
+        if norm == n or norm == n.split(" ")[0] or norm.replace(" ", "") == n.replace(" ", ""):
+            return eid
+    aliases = {"static": 1, "fixed": 1, "breathing": 2, "breathe": 2, "custom": 21, "perkey": 21,
+               "per key": 21, "self define": 21, "self-define": 21, "windmill": 15, "waterfall": 16,
+               "ripples": 7, "stars": 8, "snake": 10, "neon": 11, "wave": 13, "storm": 18}
+    if norm in aliases:
+        return aliases[norm]
+    raise DeviceError("unknown effect %r (see 'aula-f75 effects')" % text)
+
+
+# --------------------------------------------------------------------------
+# Transports
+# --------------------------------------------------------------------------
+class WiredTransport:
+    name = "wired"
+
+    def __init__(self, path, verbose=False, dry_run=False):
+        self.path = path
+        self.verbose = verbose
+        self.dry_run = dry_run
+        self.fd = None
+        if not dry_run:
+            try:
+                self.fd = os.open(path, os.O_RDWR)
+            except PermissionError:
+                raise DeviceError("permission denied on %s (install the udev rule: aula-f75 udev)" % path)
+            except OSError as e:
+                raise DeviceError("cannot open %s: %s" % (path, e))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def _log(self, direction, pkt):
+        if self.verbose:
+            print("%s %s ..." % (direction, pkt[:24].hex(" ")), file=sys.stderr)
+
+    def _set_feature(self, pkt, retries=3):
+        self._log("->", pkt)
+        if self.dry_run:
+            return
+        last = None
+        for attempt in range(retries):
+            try:
+                fcntl.ioctl(self.fd, HIDIOCSFEATURE(len(pkt)), bytearray(pkt))
+                return
+            except OSError as e:
+                last = e
+                time.sleep(0.07)
+        raise DeviceError("SET_FEATURE failed on %s: %s" % (self.path, last))
+
+    def _get_feature(self):
+        buf = bytearray(WIRED_REPORT_LEN)
+        buf[0] = WIRED_REPORT_ID
+        if self.dry_run:
+            return bytes(buf)
+        try:
+            fcntl.ioctl(self.fd, HIDIOCGFEATURE(len(buf)), buf)
+        except OSError as e:
+            raise DeviceError("GET_FEATURE failed on %s: %s" % (self.path, e))
+        self._log("<-", bytes(buf))
+        return bytes(buf)
+
+    def write_block(self, cmd, sub, data):
+        for pkt in wired_write_packets(cmd, sub, data):
+            time.sleep(WIRED_PACKET_DELAY)
+            self._set_feature(pkt)
+
+    def read_block(self, cmd, sub, size):
+        total = max(1, (size + WIRED_CHUNK - 1) // WIRED_CHUNK)
+        out = bytearray(size)
+        if self.dry_run:
+            # Pretend the board answered with the captured defaults so the
+            # frames that would follow can be inspected.
+            for i in range(total):
+                n = min(WIRED_CHUNK, size - i * WIRED_CHUNK)
+                self._set_feature(wired_read_request(cmd, sub, total, i, n))
+            if cmd == CMD_LED:
+                return TEMPLATE_LED_BLOCK[:size].ljust(size, b"\0")
+            if cmd == CMD_RGB_TABLE:
+                return default_rgb_table()[:size].ljust(size, b"\0")
+            return bytes(out)
+        for i in range(total):
+            n = min(WIRED_CHUNK, size - i * WIRED_CHUNK)
+            time.sleep(WIRED_PACKET_DELAY)
+            self._set_feature(wired_read_request(cmd, sub, total, i, n))
+            time.sleep(WIRED_PACKET_DELAY)
+            reply = self._get_feature()
+            if self.dry_run:
+                continue
+            if reply[1] != (cmd | CMD_READ):
+                raise DeviceError("read 0x%02x: reply carries command 0x%02x" % (cmd, reply[1]))
+            out[i * WIRED_CHUNK:i * WIRED_CHUNK + n] = reply[8:8 + n]
+        return bytes(out)
+
+    # High-level
+    def read_led(self):
+        return self.read_block(CMD_LED, 0, LED_BLOCK_LEN)
+
+    def write_led(self, block):
+        self.write_block(CMD_LED, 0, block)
+
+    def read_rgb_table(self):
+        return self.read_block(CMD_RGB_TABLE, 0, RGB_TABLE_LEN)
+
+    def write_rgb_table(self, table):
+        self.write_block(CMD_RGB_TABLE, 0, table)
+
+    def write_perkey(self, rgb_bytes):
+        self.write_block(CMD_PERKEY, 0, rgb_bytes)
+
+    def read_perkey(self):
+        return self.read_block(CMD_PERKEY, 0, PERKEY_LEN)
+
+    def read_matrix(self, layer):
+        return self.read_block(CMD_MATRIX, layer, MATRIX_LEN * 4)
+
+    def write_matrix(self, layer, data):
+        self.write_block(CMD_MATRIX, layer, data)
+
+    def reset(self):
+        self.write_block(CMD_RESET, 0, b"\x01")
+
+
+class WirelessTransport:
+    """Best-effort 2.4 GHz dongle transport (report 0x13, 20-byte frames)."""
+    name = "wireless"
+
+    def __init__(self, path, verbose=False, dry_run=False):
+        self.path = path
+        self.verbose = verbose
+        self.dry_run = dry_run
+        self.fd = None
+        if not dry_run:
+            try:
+                self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            except PermissionError:
+                raise DeviceError("permission denied on %s (install the udev rule: aula-f75 udev)" % path)
+            except OSError as e:
+                raise DeviceError("cannot open %s: %s" % (path, e))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def _send(self, frame):
+        if self.verbose:
+            print("-> %s" % frame.hex(" "), file=sys.stderr)
+        if self.dry_run:
+            return
+        try:
+            os.write(self.fd, frame)
+        except OSError as e:
+            raise DeviceError("write failed on %s: %s" % (self.path, e))
+
+    def _drain(self):
+        if self.dry_run:
+            return
+        while True:
+            r, _, _ = select.select([self.fd], [], [], 0)
+            if not r:
+                return
+            try:
+                os.read(self.fd, 64)
+            except OSError:
+                return
+
+    def _send_pages(self, frames):
+        for f in frames:
+            time.sleep(WL_FRAME_DELAY)
+            self._send(f)
+
+    def write_led(self, block):
+        # Mirrors the vendor sequence: a 0x44 probe, a pause, then the pages.
+        self._send(wl_read_request(WL_CMD_READ_LED))
+        time.sleep(WL_PRE_LED_DELAY)
+        self._send_pages(wl_pages(WL_CMD_LED, block))
+
+    def write_rgb_table(self, table):
+        self._send_pages(wl_pages(WL_CMD_RGB_TABLE, table))
+        time.sleep(0.1)
+
+    def read_led(self):
+        """Ask the dongle to stream the LED block back. Falls back to the
+        captured template when nothing comes back within the timeout."""
+        if self.dry_run:
+            return TEMPLATE_LED_BLOCK
+        self._drain()
+        self._send(wl_read_request(WL_CMD_READ_LED))
+        pages = {}
+        total = None
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                frame = os.read(self.fd, 64)
+            except OSError:
+                break
+            if len(frame) < WL_FRAME_LEN or frame[0] != WL_REPORT_ID:
+                continue
+            if frame[1] not in (WL_CMD_READ_LED, WL_CMD_LED):
+                continue
+            if wl_checksum(frame) != frame[19]:
+                continue
+            total = frame[2] or total
+            idx, n = frame[3], frame[4]
+            pages[idx] = bytes(frame[5:5 + n])
+            if total and len(pages) >= total:
+                break
+        if total and len(pages) >= total:
+            data = b"".join(pages[i] for i in range(total))
+            if len(data) >= LED_BLOCK_LEN and check_signature(data, OFF_LED_SIG):
+                return data[:LED_BLOCK_LEN]
+        print("warning: wireless read gave no usable LED block; using the captured template",
+              file=sys.stderr)
+        return TEMPLATE_LED_BLOCK
+
+    def read_rgb_table(self):
+        return default_rgb_table()
+
+    def write_perkey(self, rgb_bytes):
+        raise DeviceError("per-key colours over the 2.4 GHz dongle are not supported yet (use USB)")
+
+    def read_perkey(self):
+        raise DeviceError("per-key read over the 2.4 GHz dongle is not supported")
+
+    def read_matrix(self, layer):
+        raise DeviceError("key matrix access over the 2.4 GHz dongle is not supported")
+
+    def write_matrix(self, layer, data):
+        raise DeviceError("key matrix access over the 2.4 GHz dongle is not supported")
+
+    def reset(self):
+        raise DeviceError("reset over the 2.4 GHz dongle is not supported")
+
+
+def open_transport(args):
+    dev = pick_device(prefer=args.transport, explicit=args.device)
+    if dev is None:
+        raise DeviceError("no AULA F75 found (wired 258a:010c or dongle 3554:fa09)")
+    cls = WiredTransport if dev["transport"] == "wired" else WirelessTransport
+    t = cls(dev["path"], verbose=args.verbose, dry_run=args.dry_run)
+    t.info = dev
+    return t
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+def status_dict(t, block, table=None):
+    st = decode_led_block(block)
+    st.update({
+        "connected": True,
+        "transport": t.name,
+        "device": t.path,
+        "name": t.info.get("name", ""),
+        "brightness_max": BRIGHTNESS_MAX,
+        "speed_max": SPEED_MAX,
+    })
+    if table is not None and st["effect"] in EFFECT_BY_ID and st["effect"] not in (0, EFFECT_CUSTOM):
+        st["colour"] = colour_hex(read_rgb_slot(table, st["effect"], min(st["colour_index"], 6)))
+        st["palette"] = [colour_hex(read_rgb_slot(table, st["effect"], k)) for k in range(7)]
+    st["effects"] = [{"id": e[0], "name": e[1], "has_speed": e[2], "has_colour": e[3], "hidden": e[4]}
+                     for e in EFFECTS]
+    return st
+
+
+def emit(args, data, text=None):
+    if args.json:
+        print(json.dumps(data, indent=None if args.compact else 2))
+    elif text is not None:
+        print(text)
+
+
+def cmd_detect(args):
+    devs = enumerate_devices()
+    dev = pick_device(prefer=args.transport, explicit=args.device)
+    data = {"connected": dev is not None, "devices": devs,
+            "selected": dev}
+    if args.json:
+        emit(args, data)
+    elif dev:
+        print("%s %s (%s)" % (dev["transport"], dev["path"], dev["name"] or "AULA F75"))
+    else:
+        print("no AULA F75 found")
+    return 0 if dev else 1
+
+
+def cmd_status(args):
+    t = open_transport(args)
+    try:
+        block = t.read_led()
+        table = None
+        if t.name == "wired" or args.transport == "wireless":
+            try:
+                table = t.read_rgb_table()
+            except DeviceError:
+                table = None
+        st = status_dict(t, block, table)
+    finally:
+        t.close()
+    if args.json:
+        emit(args, st)
+    else:
+        print("Device      : %s via %s (%s)" % (st["name"] or "AULA F75", st["transport"], st["device"]))
+        print("Effect      : %s (id %d)" % (st["effect_name"], st["effect"]))
+        print("Brightness  : %d / %d" % (st["brightness"], BRIGHTNESS_MAX))
+        if st["has_speed"]:
+            print("Speed       : %d / %d" % (st["speed"], SPEED_MAX))
+        if st["has_colour"]:
+            print("Colour      : %s" % ("colourful" if st["colorful"] else st.get("colour", "slot %d" % st["colour_index"])))
+        print("Sleep       : %s" % ("off" if not st["sleep_hw"] else "%g min" % st["sleep_minutes"]))
+        print("Debounce    : %d" % st["debounce"])
+        if not st["signature_ok"]:
+            print("warning: LED block signature missing; the read may be garbage", file=sys.stderr)
+    return 0
+
+
+def apply_changes(args, effect=None, brightness=None, speed=None, colour=None, colorful=None,
+                  sleep_minutes=None, debounce=None):
+    t = open_transport(args)
+    try:
+        block = t.read_led()
+        if not check_signature(block, OFF_LED_SIG) and not args.force:
+            raise DeviceError("LED block signature mismatch; refusing to write (use --force to override)")
+        colour_index = None
+        if colorful is True:
+            colour_index = COLOUR_RANDOM
+        elif colorful is False or colour is not None:
+            colour_index = 0
+        new_block = patch_led_block(block, effect=effect, brightness=brightness, speed=speed,
+                                    colour_index=colour_index,
+                                    sleep_hw=sleep_hw_from_minutes(sleep_minutes), debounce=debounce)
+        eff = new_block[OFF_EFFECT]
+        if colour is not None and eff not in (0, EFFECT_CUSTOM):
+            table = t.read_rgb_table()
+            if not check_signature(table, OFF_RGB_SIG) and not args.force:
+                if t.name == "wired":
+                    raise DeviceError("colour table signature mismatch; refusing to write (use --force)")
+            table = patch_rgb_table(table, eff, 0, parse_colour(colour))
+            t.write_rgb_table(table)
+        if new_block != block or colour is not None or args.force:
+            t.write_led(new_block)
+        st = status_dict(t, new_block)
+    finally:
+        t.close()
+    return st
+
+
+def cmd_set(args):
+    if args.sleep is not None and args.sleep.lower() not in ("off", "never"):
+        float(args.sleep)  # validate
+    st = apply_changes(args,
+                       effect=parse_effect(args.effect) if args.effect else None,
+                       brightness=args.brightness, speed=args.speed, colour=args.colour,
+                       colorful=(True if args.colorful == "on" else False if args.colorful == "off" else None),
+                       sleep_minutes=args.sleep, debounce=args.debounce)
+    emit(args, st, "ok: %s, brightness %d" % (st["effect_name"], st["brightness"]))
+    return 0
+
+
+def cmd_effect(args):
+    st = apply_changes(args, effect=parse_effect(args.name))
+    emit(args, st, "effect: %s" % st["effect_name"])
+    return 0
+
+
+def cmd_brightness(args):
+    st = apply_changes(args, brightness=args.level)
+    emit(args, st, "brightness: %d" % st["brightness"])
+    return 0
+
+
+def cmd_speed(args):
+    st = apply_changes(args, speed=args.level)
+    emit(args, st, "speed: %d" % st["speed"])
+    return 0
+
+
+def cmd_colour(args):
+    st = apply_changes(args, colour=args.colour)
+    emit(args, st, "colour: %s on %s" % (colour_hex(parse_colour(args.colour)), st["effect_name"]))
+    return 0
+
+
+def cmd_colorful(args):
+    st = apply_changes(args, colorful=(args.state == "on"))
+    emit(args, st, "colourful: %s" % args.state)
+    return 0
+
+
+def cmd_sleep(args):
+    st = apply_changes(args, sleep_minutes=args.minutes)
+    emit(args, st, "sleep: %s" % ("off" if not st["sleep_hw"] else "%g min" % st["sleep_minutes"]))
+    return 0
+
+
+def cmd_debounce(args):
+    st = apply_changes(args, debounce=args.level)
+    emit(args, st, "debounce: %d" % st["debounce"])
+    return 0
+
+
+def cmd_off(args):
+    st = apply_changes(args, effect=0)
+    emit(args, st, "lighting off")
+    return 0
+
+
+def cmd_theme(args):
+    """Push a colour (Omarchy theme accent by default) to the current effect."""
+    colour = args.colour
+    if colour is None:
+        colour = read_theme_accent()
+        if colour is None:
+            raise DeviceError("could not find an Omarchy theme colors.toml; pass a colour")
+    effect = parse_effect(args.effect) if args.effect else None
+    st = apply_changes(args, effect=effect, colour=colour, colorful=False)
+    emit(args, st, "theme colour %s applied to %s" % (colour_hex(parse_colour(colour)), st["effect_name"]))
+    return 0
+
+
+def read_theme_accent():
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, ".local/state/omarchy/current/theme/colors.toml"),
+        os.path.join(home, ".config/omarchy/current/theme/colors.toml"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("accent") and "=" in line:
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return None
+
+
+def cmd_perkey(args):
+    colours = bytearray(PERKEY_LEN)
+    if args.file:
+        with open(args.file, encoding="utf-8") as fh:
+            spec = json.load(fh)
+        base = spec.get("all")
+        if base:
+            colours = bytearray(bytes(parse_colour(base)) * PERKEY_LEDS)
+        for k, v in spec.get("keys", {}).items():
+            i = key_index(k)
+            colours[i * 3:i * 3 + 3] = bytes(parse_colour(v))
+    if args.all:
+        colours = bytearray(bytes(parse_colour(args.all)) * PERKEY_LEDS)
+    if args.gradient:
+        a, b = (parse_colour(c) for c in args.gradient)
+        rows = len(KEY_ROWS)
+        for r, row in enumerate(KEY_ROWS):
+            f = r / max(1, rows - 1)
+            c = tuple(int(round(a[i] + (b[i] - a[i]) * f)) for i in range(3))
+            for name in row:
+                i = KEY_INDEX[name]
+                colours[i * 3:i * 3 + 3] = bytes(c)
+    for assignment in args.assign:
+        if "=" not in assignment:
+            raise DeviceError("expected KEY=#rrggbb, got %r" % assignment)
+        k, v = assignment.split("=", 1)
+        i = key_index(k)
+        colours[i * 3:i * 3 + 3] = bytes(parse_colour(v))
+    t = open_transport(args)
+    try:
+        t.write_perkey(bytes(colours))
+        block = t.read_led()
+        new_block = patch_led_block(block, effect=EFFECT_CUSTOM)
+        if args.brightness is not None:
+            new_block = patch_led_block(new_block, brightness=args.brightness)
+        t.write_led(new_block)
+        st = status_dict(t, new_block)
+    finally:
+        t.close()
+    emit(args, st, "per-key colours written; effect set to Custom")
+    return 0
+
+
+def cmd_keys(args):
+    if args.json:
+        emit(args, {"keys": KEY_INDEX, "rows": KEY_ROWS})
+    else:
+        for row in KEY_ROWS:
+            print("  ".join("%s=%d" % (k, KEY_INDEX[k]) for k in row))
+    return 0
+
+
+def cmd_effects(args):
+    if args.json:
+        emit(args, [{"id": e[0], "name": e[1], "has_speed": e[2], "has_colour": e[3], "hidden": e[4]} for e in EFFECTS])
+    else:
+        for e in EFFECTS:
+            flags = []
+            if e[2]:
+                flags.append("speed")
+            if e[3]:
+                flags.append("colour")
+            if e[4]:
+                flags.append("hidden in vendor UI")
+            print("%2d  %-20s %s" % (e[0], e[1], ", ".join(flags)))
+    return 0
+
+
+def cmd_backup(args):
+    t = open_transport(args)
+    try:
+        data = {
+            "version": __version__,
+            "transport": t.name,
+            "led_block": t.read_led().hex(),
+        }
+        if t.name == "wired":
+            data["rgb_table"] = t.read_rgb_table().hex()
+            try:
+                data["perkey"] = t.read_perkey().hex()
+            except DeviceError as e:
+                data["perkey_error"] = str(e)
+            if args.matrix:
+                data["matrix"] = {str(layer): t.read_matrix(layer).hex() for layer in (0, 1)}
+    finally:
+        t.close()
+    text = json.dumps(data, indent=2)
+    if args.output == "-":
+        print(text)
+    else:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        if not args.json:
+            print("backup written to %s" % args.output)
+    return 0
+
+
+def cmd_restore(args):
+    with open(args.file, encoding="utf-8") as fh:
+        data = json.load(fh)
+    t = open_transport(args)
+    try:
+        if "rgb_table" in data and t.name == "wired":
+            t.write_rgb_table(bytes.fromhex(data["rgb_table"]))
+        if "perkey" in data and t.name == "wired":
+            t.write_perkey(bytes.fromhex(data["perkey"]))
+        if "matrix" in data and args.matrix and t.name == "wired":
+            for layer, hx in data["matrix"].items():
+                t.write_matrix(int(layer), bytes.fromhex(hx))
+        block = bytes.fromhex(data["led_block"])
+        if not check_signature(block, OFF_LED_SIG) and not args.force:
+            raise DeviceError("backup LED block has no signature; refusing (use --force)")
+        t.write_led(block)
+        st = status_dict(t, block)
+    finally:
+        t.close()
+    emit(args, st, "restored")
+    return 0
+
+
+def cmd_raw(args):
+    t = open_transport(args)
+    try:
+        if args.read is not None:
+            data = t.read_block(args.read, args.sub, args.size) if t.name == "wired" else t.read_led()
+            print(data.hex(" "))
+        else:
+            payload = bytes.fromhex(args.data.replace(" ", ""))
+            t.write_block(args.write, args.sub, payload) if t.name == "wired" else t._send_pages(wl_pages(args.write, payload))
+            if not args.json:
+                print("sent %d bytes" % len(payload))
+    finally:
+        t.close()
+    return 0
+
+
+def cmd_reset(args):
+    if not args.yes:
+        raise DeviceError("this resets the keyboard's stored settings; pass --yes to confirm")
+    t = open_transport(args)
+    try:
+        t.reset()
+    finally:
+        t.close()
+    print("reset sent")
+    return 0
+
+
+UDEV_RULE = """# AULA F75 keyboard (wired) and its 2.4 GHz dongle: let the logged-in user talk
+# to the vendor HID interface. Installed by the Omarchy AULA F75 plugin.
+KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"
+"""
+UDEV_PATH = "/etc/udev/rules.d/60-aula-f75.rules"
+
+
+def cmd_udev(args):
+    if args.print:
+        sys.stdout.write(UDEV_RULE)
+        return 0
+    installed = False
+    try:
+        with open(UDEV_PATH, encoding="utf-8") as fh:
+            installed = fh.read() == UDEV_RULE
+    except OSError:
+        pass
+    if args.check:
+        if args.json:
+            emit(args, {"installed": installed, "path": UDEV_PATH})
+        else:
+            print("udev rule %s" % ("installed" if installed else "missing"))
+        return 0 if installed else 1
+    if os.geteuid() != 0:
+        # Re-run ourselves through pkexec so the Omarchy polkit agent asks.
+        script = os.path.abspath(sys.argv[0])
+        os.execvp("pkexec", ["pkexec", "/usr/bin/python3", script, "udev", "--install"])
+    with open(UDEV_PATH, "w", encoding="utf-8") as fh:
+        fh.write(UDEV_RULE)
+    os.system("udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw")
+    print("installed %s" % UDEV_PATH)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(prog="aula-f75", description=__doc__.split("\n\n")[0])
+    p.add_argument("--device", help="hidraw node to use instead of auto-detection")
+    p.add_argument("--transport", choices=["wired", "wireless"], help="prefer this transport when both are present")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--compact", action="store_true", help="single-line JSON")
+    p.add_argument("--verbose", "-v", action="store_true", help="hex-dump every HID transfer to stderr")
+    p.add_argument("--dry-run", action="store_true", help="do not touch the device; print what would be sent")
+    p.add_argument("--force", action="store_true", help="write even if the read-back block looks wrong")
+    p.add_argument("--version", action="version", version="aula-f75 " + __version__)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("detect", help="find the keyboard (sysfs only, no device I/O)"); s.set_defaults(func=cmd_detect)
+    s = sub.add_parser("status", help="read and decode the lighting/settings block"); s.set_defaults(func=cmd_status)
+    s = sub.add_parser("set", help="change several things in one read-modify-write")
+    s.add_argument("--effect"); s.add_argument("--brightness", type=int); s.add_argument("--speed", type=int)
+    s.add_argument("--colour", "--color", dest="colour"); s.add_argument("--colorful", choices=["on", "off"])
+    s.add_argument("--sleep", help="minutes, or 'off'"); s.add_argument("--debounce", type=int)
+    s.set_defaults(func=cmd_set)
+    s = sub.add_parser("effect", help="select a lighting effect by name or id"); s.add_argument("name"); s.set_defaults(func=cmd_effect)
+    s = sub.add_parser("brightness", help="0..9"); s.add_argument("level", type=int); s.set_defaults(func=cmd_brightness)
+    s = sub.add_parser("speed", help="0..4"); s.add_argument("level", type=int); s.set_defaults(func=cmd_speed)
+    s = sub.add_parser("colour", aliases=["color"], help="#rrggbb for the current effect"); s.add_argument("colour"); s.set_defaults(func=cmd_colour)
+    s = sub.add_parser("colorful", aliases=["colourful"], help="on|off: let the effect cycle colours"); s.add_argument("state", choices=["on", "off"]); s.set_defaults(func=cmd_colorful)
+    s = sub.add_parser("sleep", help="idle sleep (wireless) in minutes, or off"); s.add_argument("minutes"); s.set_defaults(func=cmd_sleep)
+    s = sub.add_parser("debounce", help="1..4"); s.add_argument("level", type=int); s.set_defaults(func=cmd_debounce)
+    s = sub.add_parser("off", help="turn the lighting off"); s.set_defaults(func=cmd_off)
+    s = sub.add_parser("theme", help="apply the Omarchy theme accent (or a given colour)")
+    s.add_argument("colour", nargs="?"); s.add_argument("--effect"); s.set_defaults(func=cmd_theme)
+    s = sub.add_parser("perkey", help="per-key colours (USB only), e.g. perkey --all '#202020' W=#ff0000 A=#ff0000")
+    s.add_argument("assign", nargs="*", metavar="KEY=#rrggbb"); s.add_argument("--all"); s.add_argument("--file")
+    s.add_argument("--gradient", nargs=2, metavar=("#top", "#bottom")); s.add_argument("--brightness", type=int)
+    s.set_defaults(func=cmd_perkey)
+    s = sub.add_parser("keys", help="list key names and LED indexes"); s.set_defaults(func=cmd_keys)
+    s = sub.add_parser("effects", help="list effects"); s.set_defaults(func=cmd_effects)
+    s = sub.add_parser("backup", help="save lighting (+ optionally key matrix) to JSON")
+    s.add_argument("output", nargs="?", default="-"); s.add_argument("--matrix", action="store_true"); s.set_defaults(func=cmd_backup)
+    s = sub.add_parser("restore", help="write a backup back"); s.add_argument("file"); s.add_argument("--matrix", action="store_true"); s.set_defaults(func=cmd_restore)
+    s = sub.add_parser("raw", help="send or read a raw block (for protocol work)")
+    s.add_argument("--read", type=lambda x: int(x, 0)); s.add_argument("--write", type=lambda x: int(x, 0))
+    s.add_argument("--sub", type=lambda x: int(x, 0), default=0); s.add_argument("--size", type=lambda x: int(x, 0), default=LED_BLOCK_LEN)
+    s.add_argument("--data", default=""); s.set_defaults(func=cmd_raw)
+    s = sub.add_parser("reset", help="send the vendor reset command"); s.add_argument("--yes", action="store_true"); s.set_defaults(func=cmd_reset)
+    s = sub.add_parser("udev", help="install (via pkexec) / check / print the udev rule")
+    s.add_argument("--install", action="store_true"); s.add_argument("--check", action="store_true"); s.add_argument("--print", action="store_true")
+    s.set_defaults(func=cmd_udev)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except DeviceError as e:
+        if args.json:
+            print(json.dumps({"connected": False, "error": str(e)}))
+        else:
+            print("error: %s" % e, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
