@@ -254,3 +254,26 @@ class WinLock(unittest.TestCase):
         self.assertEqual(out[0x0F], 1)
         self.assertEqual(bytes(out[:0x0F]) + bytes(out[0x10:]), m.TEMPLATE_LED_BLOCK[:0x0F] + m.TEMPLATE_LED_BLOCK[0x10:])
         self.assertEqual(m.patch_led_block(out, winlock=False), m.TEMPLATE_LED_BLOCK)
+
+
+class OsMode(unittest.TestCase):
+    """Byte 0x1b: observed 00 (Windows), 01 (Android, Fn+Q), 02 (Mac) on a real F75."""
+
+    def test_decode(self):
+        b = bytearray(m.TEMPLATE_LED_BLOCK)
+        b[0x1B] = 0
+        self.assertEqual(m.decode_led_block(bytes(b))["os_mode"], "windows")
+        b[0x1B] = 2
+        self.assertEqual(m.decode_led_block(bytes(b))["os_mode"], "mac")
+        b[0x1B] = 1
+        self.assertEqual(m.decode_led_block(bytes(b))["os_mode"], "android")
+        b[0x1B] = 3
+        self.assertEqual(m.decode_led_block(bytes(b))["os_mode"], "unknown")
+
+    def test_patch(self):
+        out = m.patch_led_block(m.TEMPLATE_LED_BLOCK, os_mode="mac")
+        self.assertEqual(out[0x1B], 2)
+        self.assertEqual(m.patch_led_block(out, os_mode="windows")[0x1B], 0)
+        self.assertEqual(m.patch_led_block(out, os_mode="android")[0x1B], 1)
+        with self.assertRaises(m.DeviceError):
+            m.patch_led_block(m.TEMPLATE_LED_BLOCK, os_mode="linux")

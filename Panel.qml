@@ -38,12 +38,14 @@ Panel {
   readonly property Item effectControl: panel.loadedContent ? panel.loadedContent.effectDropdown : null
   readonly property Item sleepControl: panel.loadedContent ? panel.loadedContent.sleepDropdown : null
   readonly property Item debounceControl: panel.loadedContent ? panel.loadedContent.debounceDropdown : null
+  readonly property Item modeControl: panel.loadedContent ? panel.loadedContent.modeGroup : null
 
   function syncControls() {
     if (!root.hasStatus) return
     if (root.effectControl) root.effectControl.value = String(root.status.effect)
     if (root.sleepControl) root.sleepControl.value = Model.sleepValue(root.status)
     if (root.debounceControl) root.debounceControl.value = String(root.status.debounce)
+    if (root.modeControl) root.modeControl.value = String(root.status.os_mode || "")
   }
   onStatusChanged: syncControls()
 
@@ -75,6 +77,7 @@ Panel {
       property alias effectDropdown: effectDropdown
       property alias sleepDropdown: sleepDropdown
       property alias debounceDropdown: debounceDropdown
+      property alias modeGroup: modeGroup
       implicitHeight: column.implicitHeight
       anchors.fill: parent
       onCloseRequested: root.close()
@@ -88,6 +91,7 @@ Panel {
         else if (t === "o" || t === "O") root.kb.toggleLighting()
         else if (t === "r" || t === "R") root.kb.refresh()
         else if (t === "w" || t === "W") root.kb.toggleWinLock()
+        else if (t === "m" || t === "M") root.kb.toggleMode()
         else if (t === "c" || t === "C") root.kb.toggleLock("caps")
         else if (t === "n" || t === "N") root.kb.toggleLock("num")
         else if (t === "s" || t === "S") root.kb.toggleLock("scroll")
@@ -315,6 +319,37 @@ Panel {
             value: root.hasStatus ? String(root.status.debounce) : ""
             onChanged: function(v) { if (root.kb && v !== "" && String(root.status.debounce) !== v) root.kb.setDebounce(parseInt(v)) }
           }
+        }
+
+        // ---- OS mode --------------------------------------------------
+        Item {
+          width: parent.width
+          height: modeHeader.implicitHeight
+          PanelSectionHeader {
+            id: modeHeader
+            anchors.left: parent.left
+            text: "Mode"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+          Text {
+            anchors.right: parent.right
+            anchors.baseline: modeHeader.baseline
+            text: root.hasStatus && root.status.os_mode === "unknown" ? "unknown mode byte 0x" + Number(root.status.os_mode_raw).toString(16) : "hold Fn: the lit key shows the mode"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+        ButtonGroup {
+          id: modeGroup
+          width: parent.width
+          enabled: root.hasStatus && !root.busy
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          options: Model.MODE_OPTIONS
+          value: root.hasStatus ? String(root.status.os_mode || "") : ""
+          onChanged: function(v) { if (root.kb && v !== "" && String(root.status.os_mode) !== v) root.kb.setMode(v) }
         }
 
         // ---- Lock keys ------------------------------------------------

@@ -94,6 +94,7 @@ A block captured from a real board, vendor driver, effect "Fixed on":
 | `0x09` | `1` while the custom per-key effect is active, else `0` | [capture] only the self-define write sets it |
 | `0x0a` | **active effect id** | [capture] the only byte that differs between the 17 effect captures |
 | `0x0f` | **Win key lock**: `1` while Fn+Win has disabled the Win key, `0` otherwise | [observed] `aula-f75 watch` on a real F75: pressing Fn+Win flips exactly this byte (`00`↔`01`), and the board with `01` had its Super key dead |
+| `0x1b` | **OS mode**: `0` Windows, `1` Android (Fn+Q), `2` macOS (Win/Alt swapped, Win lock ignored) | [observed] `aula-f75 watch` on a real F75: the Fn OS-switch combos flip exactly this byte. The factory capture has `01` (Android) |
 | `0x18` | sleep timer in 30 s units (`SleepHW`), `0` = never | [capture] wireless sleep capture patches byte 24; [driver] `SleepHW=2,3,4,6,8,10,20,30,40` ↔ `SleepUI=60…1200` s |
 | `0x38 + 2·id` | brightness for effect `id`, 0..9 | [capture] brightness capture patches `0x3a` with effect 1 active |
 | `0x39 + 2·id` | `speed << 4 \| colour`; speed 0..4, colour 0..6 picks one of the effect's seven table colours, 7 = colourful/random | [capture] `0x3b` flips `0x40`↔`0x47` with the "Colorful" switch; [driver] `Speed=0..4`, `Light=0..9` |
@@ -219,7 +220,7 @@ keyboard's own `/dev/input/eventN`, which the compositor sees as a real key
 press on that keyboard. Writing to the event node needs the extended udev rule
 (`KERNEL=="event*" … TAG+="uaccess"`).
 
-## Firmware toggles: Win lock (found), OS mode (open)
+## Firmware toggles: Win lock and OS mode
 
 Fn+Win (Win lock, white indicator) and the Windows/macOS mode switch are
 handled inside the firmware and stored in the `0x04` settings block. None of
@@ -230,13 +231,17 @@ polls the block and prints every offset that changes.
 - **Win lock = `0x0f`.** Pressing Fn+Win while watching flipped only this
   byte, `00` → `01`; writing it back through the normal read-modify-write
   switches the lock from the host (`aula-f75 winlock on|off|toggle`).
-- OS mode is still open. `0x12` (02 ↔ 03) and `0x1b` (01 ↔ 02 ↔ 00 over one
-  session) differ between boards and over time and are the next candidates.
+- **OS mode = `0x1b`.** Switching to macOS and back flipped only this byte,
+  `00` → `02` → `00`, and Fn+Q (Android) `00` → `01` → `00`;
+  `aula-f75 mode windows|android|mac|toggle` writes it. Holding Fn lights the
+  mode's key on the board (Q for Android), which is firmware-side feedback for
+  the same byte. The vendor's factory capture carries `01`.
+- `0x12` (02 ↔ 03 between boards) is still unexplained.
 
 ## What is *not* known
 
 - Meaning of lighting-block bytes `0x00`–`0x02`, `0x04`–`0x08`, `0x0b`–`0x0e`,
-  `0x10`–`0x17`, `0x19`–`0x37` and `0x64`–`0x7d` (preserved verbatim).
+  `0x10`–`0x17`, `0x19`–`0x1a`, `0x1c`–`0x37` and `0x64`–`0x7d` (preserved verbatim).
 - Whether the hidden effects 9, 14, 18 exist in the F75 firmware.
 - Dongle commands for per-key colours, key matrix and macros.
 - The macro buffer layout (documented by open-aula, not needed here).

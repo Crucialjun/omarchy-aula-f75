@@ -48,6 +48,7 @@ BarWidget {
   readonly property string effectName: status && status.effect_name ? status.effect_name : ""
   readonly property bool lightingOff: status && status.effect === 0
   readonly property bool winLocked: status && status.winlock === true
+  readonly property string osMode: status && status.os_mode ? String(status.os_mode) : ""
   readonly property bool locksAvailable: locks && locks.available === true
   readonly property bool locksWritable: locks && locks.writable === true
   readonly property bool shown: connected || !hideWhenDisconnected
@@ -116,6 +117,8 @@ BarWidget {
   function setDebounce(level) { run(["debounce", String(level)]) }
   function applyTheme() { run(["theme", Model.hexColor(Commons.Color.accent)]) }
   function installUdev() { run(["udev"]) }
+  function setMode(mode) { run(["mode", String(mode)]) }
+  function toggleMode() { run(["mode", "toggle"]) }
   function setWinLock(on) { run(["winlock", on ? "on" : "off"]) }
   function toggleWinLock() { run(["winlock", "toggle"]) }
   function setLock(key, on) { run(["lock", String(key), on ? "on" : "off"]) }
@@ -288,6 +291,7 @@ BarWidget {
     function lightsToggle(): void { root.toggleLighting() }
     function lock(key: string): void { root.toggleLock(key) }
     function winlock(): void { root.toggleWinLock() }
+    function mode(name: string): void { root.setMode(name === "" ? "toggle" : name) }
   }
 
   readonly property real openPanelIndicatorWidth: button.labelWidth
@@ -300,7 +304,7 @@ BarWidget {
     text: "󰌌"
     dimmed: !root.connected || root.lightingOff
     tooltipText: root.connected
-      ? "AULA F75 · " + (root.effectName || "…") + (root.transport === "wireless" ? " (2.4 GHz)" : "") + (root.winLocked ? " · Win locked" : "") + Model.describeLocks(root.locks, " · ")
+      ? "AULA F75 · " + (root.effectName || "…") + (root.transport === "wireless" ? " (2.4 GHz)" : "") + (root.osMode === "mac" ? " · Mac mode" : root.osMode === "android" ? " · Android mode" : "") + (root.winLocked ? " · Win locked" : "") + Model.describeLocks(root.locks, " · ")
       : "AULA F75 not connected"
 
     onPressed: function(b) {

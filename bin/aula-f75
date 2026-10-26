@@ -64,6 +64,9 @@ SIGNATURE = b"\x5a\xa5"
 OFF_DEBOUNCE = 0x03
 OFF_CUSTOM_FLAG = 0x09
 OFF_WINLOCK = 0x0F                # 1 while the Win key is locked (Fn+Win), else 0
+OFF_OSMODE = 0x1B                 # 0 = Windows, 1 = Android (Fn+Q), 2 = Mac (observed while switching)
+OS_MODES = {0: "windows", 1: "android", 2: "mac"}
+OS_MODE_IDS = {v: k for k, v in OS_MODES.items()}
 OFF_EFFECT = 0x0A
 OFF_SLEEP = 0x18
 OFF_EFFECT_TABLE = 0x38           # 2 bytes per effect id: brightness, speed<<4|colour
@@ -435,14 +438,20 @@ def decode_led_block(block):
         "sleep_minutes": round(sleep_hw * 30 / 60, 1) if sleep_hw else 0,
         "debounce": block[OFF_DEBOUNCE],
         "winlock": block[OFF_WINLOCK] == 1,
+        "os_mode": OS_MODES.get(block[OFF_OSMODE], "unknown"),
+        "os_mode_raw": block[OFF_OSMODE],
         "custom_flag": block[OFF_CUSTOM_FLAG],
         "signature_ok": check_signature(block, OFF_LED_SIG),
     }
 
 
 def patch_led_block(block, effect=None, brightness=None, speed=None, colour_index=None,
-                    sleep_hw=None, debounce=None, winlock=None):
+                    sleep_hw=None, debounce=None, winlock=None, os_mode=None):
     out = bytearray(block)
+    if os_mode is not None:
+        if os_mode not in OS_MODE_IDS:
+            raise DeviceError("os mode must be one of: %s" % ", ".join(OS_MODE_IDS))
+        out[OFF_OSMODE] = OS_MODE_IDS[os_mode]
     if winlock is not None:
         out[OFF_WINLOCK] = 1 if winlock else 0
     if effect is not None:
@@ -941,6 +950,7 @@ def cmd_status(args):
         print("Sleep       : %s" % ("off" if not st["sleep_hw"] else "%g min" % st["sleep_minutes"]))
         print("Debounce    : %d" % st["debounce"])
         print("Win lock    : %s" % ("on" if st["winlock"] else "off"))
+        print("Mode        : %s" % (st["os_mode"] if st["os_mode"] != "unknown" else "unknown (0x%02x)" % st["os_mode_raw"]))
         print("Lock keys   : %s" % describe_locks(st["locks"]))
         if not st["signature_ok"]:
             print("warning: LED block signature missing; the read may be garbage", file=sys.stderr)
@@ -948,7 +958,7 @@ def cmd_status(args):
 
 
 def apply_changes(args, effect=None, brightness=None, speed=None, colour=None, colorful=None,
-                  sleep_minutes=None, debounce=None, winlock=None):
+                  sleep_minutes=None, debounce=None, winlock=None, os_mode=None):
     t = open_transport(args)
     try:
         block = t.read_led()
@@ -962,7 +972,7 @@ def apply_changes(args, effect=None, brightness=None, speed=None, colour=None, c
         new_block = patch_led_block(block, effect=effect, brightness=brightness, speed=speed,
                                     colour_index=colour_index,
                                     sleep_hw=sleep_hw_from_minutes(sleep_minutes), debounce=debounce,
-                                    winlock=winlock)
+                                    winlock=winlock, os_mode=os_mode)
         eff = new_block[OFF_EFFECT]
         if colour is not None and eff not in (0, EFFECT_CUSTOM):
             table = t.read_rgb_table()
@@ -987,7 +997,8 @@ def cmd_set(args):
                        brightness=args.brightness, speed=args.speed, colour=args.colour,
                        colorful=(True if args.colorful == "on" else False if args.colorful == "off" else None),
                        sleep_minutes=args.sleep, debounce=args.debounce,
-                       winlock=(True if args.winlock == "on" else False if args.winlock == "off" else None))
+                       winlock=(True if args.winlock == "on" else False if args.winlock == "off" else None),
+                       os_mode=args.mode)
     emit(args, st, "ok: %s, brightness %d" % (st["effect_name"], st["brightness"]))
     return 0
 
@@ -1047,6 +1058,21 @@ def cmd_winlock(args):
         want = args.state == "on"
     st = apply_changes(args, winlock=want)
     emit(args, st, "win lock: %s" % ("on" if st["winlock"] else "off"))
+    return 0
+
+
+def cmd_mode(args):
+    """Windows / Android / Mac mode (the Fn OS-switch combos), stored at 0x1b.
+    `toggle` flips between Windows and Mac; Android must be asked for by name."""
+    want = args.mode
+    if want == "toggle":
+        t = open_transport(args)
+        try:
+            want = "windows" if decode_led_block(t.read_led())["os_mode"] == "mac" else "mac"
+        finally:
+            t.close()
+    st = apply_changes(args, os_mode=want)
+    emit(args, st, "mode: %s" % st["os_mode"])
     return 0
 
 
@@ -1316,12 +1342,24 @@ def cmd_watch(args):
         # interleave with it and stall the controller).
         t = open_transport(args)
         try:
-            return t.read_led()
+            data = {"led": t.read_led()}
+            if args.matrix and t.name == "wired":
+                data["matrix0"] = t.read_matrix(0)
+                data["matrix1"] = t.read_matrix(1)
+            return data
         finally:
             t.close()
 
+    def diff(prev, cur):
+        out = []
+        for name in sorted(cur):
+            a, b = prev.get(name, b""), cur[name]
+            out += ["%s 0x%03x: %02x->%02x" % (name, i, a[i], b[i]) for i in range(min(len(a), len(b))) if a[i] != b[i]]
+        return out
+
     prev = poll()
-    print("baseline: " + prev.hex(" "), flush=True)
+    for name in sorted(prev):
+        print("baseline %s: %s" % (name, prev[name].hex(" ")), flush=True)
     deadline = time.time() + args.seconds if args.seconds else None
     failures = 0
     try:
@@ -1339,8 +1377,7 @@ def cmd_watch(args):
                 time.sleep(1.0)
                 continue
             if cur != prev:
-                diffs = ["0x%02x: %02x->%02x" % (i, prev[i], cur[i]) for i in range(len(cur)) if cur[i] != prev[i]]
-                print("%s %s" % (time.strftime("%H:%M:%S"), ", ".join(diffs)), flush=True)
+                print("%s %s" % (time.strftime("%H:%M:%S"), ", ".join(diff(prev, cur))), flush=True)
                 prev = cur
     except KeyboardInterrupt:
         pass
@@ -1368,7 +1405,7 @@ def build_parser():
     s.add_argument("--effect"); s.add_argument("--brightness", type=int); s.add_argument("--speed", type=int)
     s.add_argument("--colour", "--color", dest="colour"); s.add_argument("--colorful", choices=["on", "off"])
     s.add_argument("--sleep", help="minutes, or 'off'"); s.add_argument("--debounce", type=int)
-    s.add_argument("--winlock", choices=["on", "off"])
+    s.add_argument("--winlock", choices=["on", "off"]); s.add_argument("--mode", choices=["windows", "android", "mac"])
     s.set_defaults(func=cmd_set)
     s = sub.add_parser("effect", help="select a lighting effect by name or id"); s.add_argument("name"); s.set_defaults(func=cmd_effect)
     s = sub.add_parser("brightness", help="0..9"); s.add_argument("level", type=int); s.set_defaults(func=cmd_brightness)
@@ -1395,12 +1432,15 @@ def build_parser():
     s.add_argument("--data", default=""); s.set_defaults(func=cmd_raw)
     s = sub.add_parser("winlock", help="Win key lock (Fn+Win): on | off | toggle")
     s.add_argument("state", nargs="?", choices=["on", "off", "toggle"], default="toggle"); s.set_defaults(func=cmd_winlock)
+    s = sub.add_parser("mode", help="OS mode: windows | android | mac | toggle (Windows<->Mac)")
+    s.add_argument("mode", nargs="?", choices=["windows", "android", "mac", "toggle"], default="toggle"); s.set_defaults(func=cmd_mode)
     s = sub.add_parser("locks", help="state of Caps/Num/Scroll lock on the keyboard (host side)"); s.set_defaults(func=cmd_locks)
     s = sub.add_parser("lock", help="toggle or set a lock key, e.g. lock caps / lock num off")
     s.add_argument("key", help="caps | num | scroll"); s.add_argument("state", nargs="?", choices=["on", "off", "toggle"], default="toggle")
     s.set_defaults(func=cmd_lock)
     s = sub.add_parser("watch", help="poll the settings block and print bytes that change (protocol discovery)")
     s.add_argument("--interval", type=float, default=0.5); s.add_argument("--seconds", type=float, default=0)
+    s.add_argument("--matrix", action="store_true", help="also watch both key-matrix layers (USB only)")
     s.set_defaults(func=cmd_watch)
     s = sub.add_parser("reset", help="send the vendor reset command"); s.add_argument("--yes", action="store_true"); s.set_defaults(func=cmd_reset)
     s = sub.add_parser("udev", help="install (via pkexec) / check / print the udev rule")

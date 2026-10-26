@@ -97,3 +97,9 @@ function describeLocks(locks, sep) {
     if (locks[LOCK_KEYS[i].key] === true) out += (sep || " · ") + LOCK_KEYS[i].full
   return out
 }
+
+var MODE_OPTIONS = [
+  { value: "windows", label: "Windows" },
+  { value: "android", label: "Android" },
+  { value: "mac", label: "macOS" }
+]
