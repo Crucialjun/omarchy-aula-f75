@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "crucialjun.aula-f75",
   "name": "AULA F75",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "crucialjun",
   "license": "MIT",
   "description": "Lighting, colour, sleep, debounce and lock-key (Caps/Num/Scroll) control for the AULA F75 keyboard over USB or the 2.4 GHz dongle, with optional theme-accent sync",
