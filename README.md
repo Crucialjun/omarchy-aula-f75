@@ -28,6 +28,9 @@ driver, USB captures and the board itself.
 - **Caps / Num / Scroll Lock** – live state read from the keyboard's own
   indicator LEDs, with switches to toggle each one.
 - Wireless sleep timer and key debounce.
+- **Battery and active link** – which connection the keyboard is on right now
+  (USB, 2.4 GHz dongle, Bluetooth), what else is plugged or paired, and the
+  battery percentage on the dongle, also as text next to the bar icon.
 
 **Around the bar**
 
@@ -69,7 +72,8 @@ says so until it is in place.
 
 Place the widget with `omarchy bar move crucialjun.aula-f75 --section right`
 and configure it under **Setup › Plugins** (theme sync, hide when
-disconnected, hidden effects, poll interval).
+disconnected, hidden effects, poll interval, battery on the bar, battery
+poll interval).
 
 Requirements: Omarchy Quattro or newer (the Quickshell shell with plugins)
 and `/usr/bin/python3`, which Omarchy already ships.
@@ -88,6 +92,7 @@ python3 $P sleep 10                  # minutes, or off (wireless idle sleep)
 python3 $P debounce 2                # 1..4
 python3 $P mode mac                  # OS mode: windows | android | mac | toggle
 python3 $P winlock off               # Win key lock (Fn+Win): on | off | toggle
+python3 $P battery                   # battery percent and the active link
 python3 $P locks                     # Caps/Num/Scroll lock state
 python3 $P lock caps                 # toggle (or: lock num off, lock scroll on)
 python3 $P theme                     # apply the Omarchy theme accent

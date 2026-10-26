@@ -27,6 +27,8 @@ BarWidget {
   readonly property bool themeSync: setting("themeSync", false) === true
   readonly property bool showHiddenEffects: setting("showHiddenEffects", false) === true
   readonly property int pollSeconds: Math.max(2, parseInt(setting("pollSeconds", 10)) || 10)
+  readonly property bool showBatteryOnBar: setting("showBatteryOnBar", true) === true
+  readonly property int batteryPollSeconds: Math.max(15, parseInt(setting("batteryPollSeconds", 120)) || 120)
 
   // ---- Device state
   property bool connected: false
@@ -35,6 +37,11 @@ BarWidget {
   property var status: ({})
   // Caps/Num/Scroll lock, as the kernel reports the keyboard's own LEDs.
   property var locks: ({})
+  // Links the host can see (usb / dongle / bluetooth) and the battery of the
+  // one that answers; battery is null while wired or unknown.
+  property var links: ({})
+  property var battery: null
+  property bool charging: false
   property bool busy: false
   property string lastError: ""
   property bool permissionDenied: false
@@ -48,6 +55,10 @@ BarWidget {
   readonly property string effectName: status && status.effect_name ? status.effect_name : ""
   readonly property bool lightingOff: status && status.effect === 0
   readonly property bool winLocked: status && status.winlock === true
+  readonly property bool wirelessLink: connected && transport !== "wired"
+  readonly property string batteryText: battery === null || battery === undefined ? "" : battery + "%"
+  // On the bar: always on a wireless link; on the cable only while it is still filling up.
+  readonly property bool showBatteryText: showBatteryOnBar && batteryText !== "" && (wirelessLink || (charging && battery < 100))
   readonly property string osMode: status && status.os_mode ? String(status.os_mode) : ""
   readonly property bool locksAvailable: locks && locks.available === true
   readonly property bool locksWritable: locks && locks.writable === true
@@ -88,6 +99,8 @@ BarWidget {
 
   function absorb(parsed, stderrText) {
     if (parsed && parsed.locks) root.locks = parsed.locks
+    if (parsed && parsed.links) root.links = parsed.links
+    if (parsed && parsed.battery !== undefined) { root.battery = parsed.battery; root.charging = parsed.charging === true }
     if (parsed && parsed.connected === false) {
       root.lastError = String(parsed.error || "device error")
       root.permissionDenied = /permission denied/i.test(root.lastError)
@@ -124,6 +137,13 @@ BarWidget {
   function setLock(key, on) { run(["lock", String(key), on ? "on" : "off"]) }
   function toggleLock(key) { run(["lock", String(key), "toggle"]) }
 
+  // One 20-byte frame over the dongle (or the 0x87 read over USB).
+  function refreshBattery() {
+    if (!root.connected || batteryProc.running || actionProc.running || statusProc.running) return
+    batteryProc.command = root.cliBase.concat(["battery"])
+    batteryProc.running = true
+  }
+
   // Cheap sysfs read, no device I/O: safe to poll while the panel is open.
   function refreshLocks() {
     if (!root.connected || locksProc.running || actionProc.running) return
@@ -158,6 +178,8 @@ BarWidget {
     } else {
       root.status = ({})
       root.locks = ({})
+      root.battery = null
+      root.charging = false
     }
   }
 
@@ -177,6 +199,8 @@ BarWidget {
       root.transport = sel ? String(sel.transport) : ""
       root.devicePath = sel ? String(sel.path) : ""
       root.locks = parsed.locks || ({})
+      root.links = parsed.links || ({})
+      if (!root.connected) root.battery = null
       if (root.connected && !was) root.refresh()
     }
   }
@@ -209,6 +233,30 @@ BarWidget {
       // again so the panel shows what it is really doing now.
       else if (!parsed || (parsed.effect === undefined && parsed.locks === undefined)) root.refresh()
     }
+  }
+
+  Process {
+    id: batteryProc
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root._batteryOut = text }
+    onExited: function(exitCode) {
+      var parsed = Model.parseJson(root._batteryOut)
+      root._batteryOut = ""
+      if (parsed && parsed.connected !== false) {
+        if (parsed.links) root.links = parsed.links
+        if (parsed.battery !== undefined) { root.battery = parsed.battery; root.charging = parsed.charging === true }
+      }
+    }
+  }
+  property string _batteryOut: ""
+
+  Timer {
+    interval: root.batteryPollSeconds * 1000
+    running: root.connected
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshBattery()
   }
 
   Process {
@@ -292,6 +340,7 @@ BarWidget {
     function lock(key: string): void { root.toggleLock(key) }
     function winlock(): void { root.toggleWinLock() }
     function mode(name: string): void { root.setMode(name === "" ? "toggle" : name) }
+    function battery(): void { root.refreshBattery() }
   }
 
   readonly property real openPanelIndicatorWidth: button.labelWidth
@@ -301,10 +350,10 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰌌"
+    text: "󰌌" + (root.showBatteryText ? " " + root.batteryText : "")
     dimmed: !root.connected || root.lightingOff
     tooltipText: root.connected
-      ? "AULA F75 · " + (root.effectName || "…") + (root.transport === "wireless" ? " (2.4 GHz)" : "") + (root.osMode === "mac" ? " · Mac mode" : root.osMode === "android" ? " · Android mode" : "") + (root.winLocked ? " · Win locked" : "") + Model.describeLocks(root.locks, " · ")
+      ? "AULA F75 · " + (root.effectName || "…") + " · " + Model.describeLink(root) + (root.osMode === "mac" ? " · Mac mode" : root.osMode === "android" ? " · Android mode" : "") + (root.winLocked ? " · Win locked" : "") + Model.describeLocks(root.locks, " · ")
       : "AULA F75 not connected"
 
     onPressed: function(b) {

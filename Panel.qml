@@ -89,7 +89,7 @@ Panel {
         if (!root.kb) return
         if (t === "t" || t === "T") root.kb.applyTheme()
         else if (t === "o" || t === "O") root.kb.toggleLighting()
-        else if (t === "r" || t === "R") root.kb.refresh()
+        else if (t === "r" || t === "R") { root.kb.refresh(); root.kb.refreshBattery() }
         else if (t === "w" || t === "W") root.kb.toggleWinLock()
         else if (t === "m" || t === "M") root.kb.toggleMode()
         else if (t === "c" || t === "C") root.kb.toggleLock("caps")
@@ -109,7 +109,7 @@ Panel {
           meta: root.hasStatus
             ? Model.describe(root.status)
             : (root.connected ? (root.lastError !== "" ? root.lastError : "Reading…") : "Plug the keyboard in or pair the dongle")
-          detail: root.connected ? (root.kb.transport === "wireless" ? "2.4 GHz" : "USB") : ""
+          detail: Model.describeLink(root.kb)
           foreground: root.foreground
           fontFamily: root.fontFamily
           iconOpacity: root.connected && !(root.status && root.status.effect === 0) ? 1.0 : 0.5
@@ -318,6 +318,78 @@ Panel {
             options: Model.DEBOUNCE_OPTIONS
             value: root.hasStatus ? String(root.status.debounce) : ""
             onChanged: function(v) { if (root.kb && v !== "" && String(root.status.debounce) !== v) root.kb.setDebounce(parseInt(v)) }
+          }
+        }
+
+        // ---- Connection -----------------------------------------------
+        Column {
+          width: parent.width
+          spacing: Style.spacing.labelGap
+          visible: root.connected
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+          Item {
+            width: parent.width
+            height: linkHeader.implicitHeight
+            PanelSectionHeader {
+              id: linkHeader
+              anchors.left: parent.left
+              text: "Connection"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Text {
+              anchors.right: parent.right
+              anchors.baseline: linkHeader.baseline
+              text: root.kb ? Model.describeLinks(root.kb.links, root.kb.transport) : ""
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.controlGap
+
+            Text {
+              text: root.kb ? Model.batteryIcon(root.kb.battery, root.kb.charging) : ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.icon
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            Column {
+              spacing: Style.spacing.xs
+              anchors.verticalCenter: parent.verticalCenter
+              Text {
+                text: root.kb ? "Active link: " + Model.linkName(root.kb.transport) : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              Text {
+                text: !root.kb ? "" : (root.kb.batteryText !== ""
+                  ? "Battery " + root.kb.batteryText + (root.kb.charging ? ", charging" : "")
+                  : (root.kb.wirelessLink ? "Battery unknown (press a key and refresh)" : "Powered over the cable"))
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          PanelSlider {
+            bar: root.bar
+            width: parent.width
+            visible: root.kb && root.kb.batteryText !== ""
+            minimum: 0
+            maximum: 100
+            step: 1
+            integer: true
+            tickCount: 0
+            value: root.kb && root.kb.battery !== null ? root.kb.battery : 0
+            enabled: false
           }
         }
 

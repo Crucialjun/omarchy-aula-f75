@@ -277,3 +277,37 @@ class OsMode(unittest.TestCase):
         self.assertEqual(m.patch_led_block(out, os_mode="android")[0x1B], 1)
         with self.assertRaises(m.DeviceError):
             m.patch_led_block(m.TEMPLATE_LED_BLOCK, os_mode="linux")
+
+
+class DongleStatus(unittest.TestCase):
+    """Frames captured from a real F75 on its 2.4 GHz dongle."""
+
+    def test_unsolicited_status(self):
+        f = bytes.fromhex("13 0a 01 00 04 05 64 01 00 00 00 00 00 00 00 00 00 00 00 8c")
+        self.assertEqual(m.wl_checksum(f), f[19])
+        st = m.wl_parse_status(f)
+        self.assertEqual((st["battery"], st["flag"], st["link_type"]), (100, 1, 1))
+        self.assertFalse(st["charging"])
+
+    def test_usb_power_reply_flags_charging(self):
+        # 0x87 reply on the cable: 64 11 -> 100 %, flag 0x11 (bit 4 = charging)
+        p = m.power_dict(0x64, 0x11, 0, "64 11")
+        self.assertEqual(p["battery"], 100)
+        self.assertTrue(p["charging"])
+
+    def test_requested_status(self):
+        f = bytes.fromhex("13 4a 01 00 02 64 01 00 00 00 00 00 00 00 00 00 00 00 00 c5")
+        self.assertEqual(m.wl_checksum(f), f[19])
+        self.assertEqual(m.wl_parse_status(f)["battery"], 100)
+        self.assertEqual(m.wl_frame(m.WL_CMD_READ_STATUS, 1, 0, b"")[:5], bytes([0x13, 0x4a, 1, 0, 0]))
+
+    def test_info_carries_model_password(self):
+        f = bytes.fromhex("13 05 01 00 0a 03 00 00 00 00 cd 01 00 00 00 00 00 00 00 f4")
+        self.assertEqual(m.wl_checksum(f), f[19])
+        info = m.wl_parse_info(f)
+        self.assertTrue(info["model_ok"])
+        self.assertEqual(info["password"], m.MODEL_PASSWORD)
+
+    def test_rejects_other_frames(self):
+        self.assertIsNone(m.wl_parse_status(bytes.fromhex("13 44 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 58")))
+        self.assertIsNone(m.wl_parse_status(b"\x05\xe9\x00"))

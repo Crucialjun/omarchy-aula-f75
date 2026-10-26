@@ -84,6 +84,16 @@ WL_PAGE = 14
 WL_CMD_LED = 0x04
 WL_CMD_RGB_TABLE = 0x09
 WL_CMD_READ_LED = 0x44
+WL_CMD_INFO = 0x05                # device info: fw + the 6-byte model password
+WL_CMD_STATUS = 0x0A              # unsolicited status (also streamed on key presses)
+WL_CMD_READ_STATUS = 0x4A         # ask for one status frame: battery percent
+MODEL_PASSWORD = bytes([0x03, 0x00, 0x00, 0x00, 0x00, 0xCD])   # KB.ini Psd=3,0,0,0,0,cd
+BATTERY_FLAG_CHARGING = 0x10      # flag byte after the percent: 0x01 on the dongle, 0x11 on the cable
+
+
+def power_dict(pct, flag, link_type, raw):
+    return {"battery": pct, "flag": flag, "charging": bool(flag & BATTERY_FLAG_CHARGING),
+            "link_type": link_type, "raw": raw}
 WL_FRAME_DELAY = 0.025
 WL_PRE_LED_DELAY = 0.17           # the vendor driver pauses ~170 ms before the LED pages
 
@@ -237,6 +247,47 @@ def enumerate_devices():
             "vendor_iface": vendor,
         })
     return found
+
+
+def _input_devices():
+    out = []
+    for inp in glob.glob("/sys/class/input/input*"):
+        name = _read_sysfs(inp + "/name", b"").decode(errors="replace").strip()
+        bus = _read_sysfs(inp + "/id/bustype", b"0").decode().strip()
+        out.append((inp, name, bus))
+    return out
+
+
+def detect_links():
+    """Which links to the keyboard the host can see right now (no device I/O).
+
+    usb       the wired vendor interface is enumerated (keyboard on the cable)
+    dongle    the 2.4 GHz receiver is plugged in (says nothing about the board)
+    bluetooth an input device on the Bluetooth bus whose name looks like the F75,
+              plus the kernel's HID battery for it when present
+    """
+    devs = enumerate_devices()
+    links = {
+        "usb": any(d["transport"] == "wired" and d["vendor_iface"] for d in devs),
+        "dongle": any(d["transport"] == "wireless" and d["vendor_iface"] for d in devs),
+        "bluetooth": False,
+        "bluetooth_name": "",
+        "bluetooth_battery": None,
+    }
+    for inp, name, bus in _input_devices():
+        if bus.lower() == "0005" and any(k in name.lower() for k in ("f75", "aula", "by tech")):
+            links["bluetooth"] = True
+            links["bluetooth_name"] = name
+            break
+    if links["bluetooth"]:
+        for ps in glob.glob("/sys/class/power_supply/hid-*-battery*"):
+            model = _read_sysfs(ps + "/model_name", b"").decode(errors="replace").strip().lower()
+            if any(k in model for k in ("f75", "aula", "by tech")):
+                cap = _read_sysfs(ps + "/capacity", b"").decode().strip()
+                if cap.isdigit():
+                    links["bluetooth_battery"] = int(cap)
+                break
+    return links
 
 
 def pick_device(prefer=None, explicit=None):
@@ -403,6 +454,38 @@ def wl_pages(cmd, data):
     data = bytes(data)
     total = max(1, (len(data) + WL_PAGE - 1) // WL_PAGE)
     return [wl_frame(cmd, total, i, data[i * WL_PAGE:(i + 1) * WL_PAGE]) for i in range(total)]
+
+
+def wl_parse_status(frame):
+    """Decode a 0x0A (unsolicited) or 0x4A (requested) dongle status frame.
+
+    Observed on a real F75 over the dongle:
+      13 0a 01 00 04 05 64 01 ... : spontaneous, byte 6 = battery percent
+      13 4a 01 00 02 64 01 00 ... : reply to 0x4a, byte 5 = battery percent
+    Byte 2 is the link type the dongle reports (1 = 2.4 GHz). The flag byte
+    after the percent reads 1 on a board that is on and awake; whether it
+    also encodes charging is not established.
+    """
+    if len(frame) < WL_FRAME_LEN or frame[0] != WL_REPORT_ID:
+        return None
+    if frame[1] == WL_CMD_STATUS:
+        pct, flag = frame[6], frame[7]
+    elif frame[1] == WL_CMD_READ_STATUS:
+        pct, flag = frame[5], frame[6]
+    else:
+        return None
+    if not 0 <= pct <= 100:
+        return None
+    return power_dict(pct, flag, frame[2], frame[:WL_FRAME_LEN].hex(" "))
+
+
+def wl_parse_info(frame):
+    """Decode the 0x05 reply: 13 05 01 00 <fw> <6-byte password> 01 ...
+    Observed: 13 05 01 00 0a 03 00 00 00 00 cd 01 -> password 03 00 00 00 00 cd."""
+    if len(frame) < WL_FRAME_LEN or frame[0] != WL_REPORT_ID or frame[1] != WL_CMD_INFO:
+        return None
+    return {"link_type": frame[2], "fw": frame[4], "password": bytes(frame[5:11]),
+            "model_ok": bytes(frame[5:11]) == MODEL_PASSWORD, "raw": frame[:WL_FRAME_LEN].hex(" ")}
 
 
 def wl_read_request(cmd):
@@ -691,6 +774,24 @@ class WiredTransport:
     def reset(self):
         self.write_block(CMD_RESET, 0, b"\x01")
 
+    def read_status(self):
+        """Battery over USB: read 0x87 (vendor `ReadPower`), byte 0 = percent,
+        byte 1 = flag. Observed on a real F75 on the cable: `64 11` = 100 %,
+        charging. Returns None unless the reply is plausible."""
+        if self.dry_run:
+            return None
+        try:
+            data = self.read_block(0x07, 2, 16)
+        except DeviceError:
+            return None
+        pct = data[0]
+        if not 0 <= pct <= 100 or data[:16] == bytes(16):
+            return None
+        return power_dict(pct, data[1], 0, data[:16].hex(" "))
+
+    def read_info(self):
+        return None
+
 
 class WirelessTransport:
     """Best-effort 2.4 GHz dongle transport (report 0x13, 20-byte frames)."""
@@ -790,6 +891,41 @@ class WirelessTransport:
 
     def read_rgb_table(self):
         return default_rgb_table()
+
+    def _ask(self, cmd, want, parse, timeout=0.8):
+        """Send a one-frame request and return the first parsable reply."""
+        if self.dry_run:
+            return None
+        self._drain()
+        self._send(wl_frame(cmd, 1, 0, b""))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                frame = os.read(self.fd, 64)
+            except OSError:
+                break
+            if len(frame) >= WL_FRAME_LEN and frame[0] == WL_REPORT_ID and frame[1] in want \
+                    and wl_checksum(frame) == frame[19]:
+                parsed = parse(frame)
+                if parsed:
+                    return parsed
+        return None
+
+    def read_status(self):
+        """Battery percent and link info, or None when the keyboard does not
+        answer through the dongle (off, asleep, or on another link)."""
+        for attempt in range(3):
+            st = self._ask(WL_CMD_READ_STATUS, (WL_CMD_READ_STATUS, WL_CMD_STATUS), wl_parse_status)
+            if st:
+                return st
+            time.sleep(0.25)   # a sleeping board answers the second or third ask
+        return None
+
+    def read_info(self):
+        return self._ask(WL_CMD_INFO, (WL_CMD_INFO,), wl_parse_info)
 
     def write_perkey(self, rgb_bytes):
         raise DeviceError("per-key colours over the 2.4 GHz dongle are not supported yet (use USB)")
@@ -894,7 +1030,13 @@ def status_dict(t, block, table=None):
         "brightness_max": BRIGHTNESS_MAX,
         "speed_max": SPEED_MAX,
         "locks": read_locks(t.path),
+        "links": detect_links(),
+        "link": t.name,
     })
+    power = getattr(t, "last_status", None)
+    st["battery"] = power["battery"] if power else None
+    st["battery_flag"] = power["flag"] if power else None
+    st["charging"] = power["charging"] if power else None
     if table is not None and st["effect"] in EFFECT_BY_ID and st["effect"] not in (0, EFFECT_CUSTOM):
         st["colour"] = colour_hex(read_rgb_slot(table, st["effect"], min(st["colour_index"], 6)))
         st["palette"] = [colour_hex(read_rgb_slot(table, st["effect"], k)) for k in range(7)]
@@ -914,7 +1056,8 @@ def cmd_detect(args):
     devs = enumerate_devices()
     dev = pick_device(prefer=args.transport, explicit=args.device)
     data = {"connected": dev is not None, "devices": devs,
-            "selected": dev, "locks": read_locks(dev["path"]) if dev else {"available": False}}
+            "selected": dev, "locks": read_locks(dev["path"]) if dev else {"available": False},
+            "links": detect_links()}
     if args.json:
         emit(args, data)
     elif dev:
@@ -934,6 +1077,7 @@ def cmd_status(args):
                 table = t.read_rgb_table()
             except DeviceError:
                 table = None
+        t.last_status = t.read_status()
         st = status_dict(t, block, table)
     finally:
         t.close()
@@ -949,6 +1093,9 @@ def cmd_status(args):
             print("Colour      : %s" % ("colourful" if st["colorful"] else st.get("colour", "slot %d" % st["colour_index"])))
         print("Sleep       : %s" % ("off" if not st["sleep_hw"] else "%g min" % st["sleep_minutes"]))
         print("Debounce    : %d" % st["debounce"])
+        print("Link        : %s" % describe_link(st))
+        if st.get("battery") is not None:
+            print("Battery     : %d%%%s" % (st["battery"], ", charging" if st.get("charging") else ""))
         print("Win lock    : %s" % ("on" if st["winlock"] else "off"))
         print("Mode        : %s" % (st["os_mode"] if st["os_mode"] != "unknown" else "unknown (0x%02x)" % st["os_mode_raw"]))
         print("Lock keys   : %s" % describe_locks(st["locks"]))
@@ -1300,6 +1447,41 @@ def cmd_udev(args):
     return 0
 
 
+def describe_link(st):
+    names = {"wired": "USB", "wireless": "2.4 GHz dongle", "bluetooth": "Bluetooth"}
+    links = st.get("links") or {}
+    extra = []
+    if st.get("link") != "wired" and links.get("usb"):
+        extra.append("cable plugged")
+    if st.get("link") != "wireless" and links.get("dongle"):
+        extra.append("dongle plugged")
+    if links.get("bluetooth"):
+        extra.append("Bluetooth paired")
+    return names.get(st.get("link"), str(st.get("link"))) + (" (%s)" % ", ".join(extra) if extra else "")
+
+
+def cmd_battery(args):
+    """Battery percent (and which link answered). Over the dongle this is one
+    20-byte frame; over USB it is the community-reported 0x87 read."""
+    t = open_transport(args)
+    try:
+        power = t.read_status()
+    finally:
+        t.close()
+    data = {"connected": True, "link": t.name, "links": detect_links(),
+            "battery": power["battery"] if power else None,
+            "battery_flag": power["flag"] if power else None,
+            "charging": power["charging"] if power else None,
+            "battery_raw": power["raw"] if power else None}
+    if args.json:
+        emit(args, data)
+    elif power:
+        print("%d%%%s via %s" % (power["battery"], ", charging" if power["charging"] else "", describe_link(data)))
+    else:
+        print("no battery reading via %s" % describe_link(data))
+    return 0 if power else 1
+
+
 def describe_locks(locks):
     if not locks or not locks.get("available"):
         return "n/a"
@@ -1434,6 +1616,7 @@ def build_parser():
     s.add_argument("state", nargs="?", choices=["on", "off", "toggle"], default="toggle"); s.set_defaults(func=cmd_winlock)
     s = sub.add_parser("mode", help="OS mode: windows | android | mac | toggle (Windows<->Mac)")
     s.add_argument("mode", nargs="?", choices=["windows", "android", "mac", "toggle"], default="toggle"); s.set_defaults(func=cmd_mode)
+    s = sub.add_parser("battery", help="battery percent and active link"); s.set_defaults(func=cmd_battery)
     s = sub.add_parser("locks", help="state of Caps/Num/Scroll lock on the keyboard (host side)"); s.set_defaults(func=cmd_locks)
     s = sub.add_parser("lock", help="toggle or set a lock key, e.g. lock caps / lock num off")
     s.add_argument("key", help="caps | num | scroll"); s.add_argument("state", nargs="?", choices=["on", "off", "toggle"], default="toggle")

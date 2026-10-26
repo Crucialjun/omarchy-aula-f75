@@ -98,6 +98,35 @@ function describeLocks(locks, sep) {
   return out
 }
 
+var LINK_NAMES = { wired: "USB", wireless: "2.4 GHz", bluetooth: "Bluetooth" }
+
+function linkName(link) { return LINK_NAMES[link] || (link ? String(link) : "") }
+
+// "2.4 GHz · 87%" for the hero; "" when unknown.
+function describeLink(kb) {
+  if (!kb || !kb.connected) return ""
+  var s = linkName(kb.transport)
+  if (kb.battery !== null && kb.battery !== undefined) s += " · " + kb.battery + "%" + (kb.charging ? " charging" : "")
+  return s
+}
+
+// Everything the host can see: "USB cable, dongle plugged, Bluetooth paired".
+function describeLinks(links, active) {
+  if (!links) return ""
+  var out = []
+  if (links.usb) out.push(active === "wired" ? "USB (active)" : "USB cable plugged")
+  if (links.dongle) out.push(active === "wireless" ? "2.4 GHz dongle (active)" : "2.4 GHz dongle plugged")
+  if (links.bluetooth) out.push("Bluetooth" + (links.bluetooth_battery !== null && links.bluetooth_battery !== undefined ? " (" + links.bluetooth_battery + "%)" : ""))
+  return out.join(", ")
+}
+
+function batteryIcon(pct, charging) {
+  if (pct === null || pct === undefined) return "󰂑"
+  if (charging) return "󰂄"
+  var icons = ["󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"]
+  return icons[Math.max(0, Math.min(10, Math.round(pct / 10)))]
+}
+
 var MODE_OPTIONS = [
   { value: "windows", label: "Windows" },
   { value: "android", label: "Android" },

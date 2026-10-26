@@ -5,7 +5,7 @@
   "version": "1.1.0",
   "author": "crucialjun",
   "license": "MIT",
-  "description": "Lighting, colour, sleep, debounce and lock-key (Caps/Num/Scroll) control for the AULA F75 keyboard over USB or the 2.4 GHz dongle, with optional theme-accent sync",
+  "description": "Lighting, colour, OS mode, Win lock, lock keys, battery and active-link status for the AULA F75 keyboard over USB or the 2.4 GHz dongle, with optional theme-accent sync",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
@@ -20,13 +20,17 @@
       "themeSync": false,
       "hideWhenDisconnected": true,
       "showHiddenEffects": false,
-      "pollSeconds": 10
+      "pollSeconds": 10,
+      "showBatteryOnBar": true,
+      "batteryPollSeconds": 120
     },
     "schema": [
       { "key": "themeSync", "type": "boolean", "label": "Theme sync", "defaultValue": false, "description": "Re-colour the keyboard whenever the Omarchy theme accent changes." },
       { "key": "hideWhenDisconnected", "type": "boolean", "label": "Hide when disconnected", "defaultValue": true, "description": "Hide the bar icon while no F75 is plugged in." },
       { "key": "showHiddenEffects", "type": "boolean", "label": "Show hidden effects", "defaultValue": false, "description": "Offer the three effects the vendor driver masks for the F75 (Shadow disappear, Retinue scanning, Rotating storm)." },
-      { "key": "pollSeconds", "type": "integer", "label": "Hot-plug poll (seconds)", "min": 2, "max": 120, "step": 1, "defaultValue": 10 }
+      { "key": "pollSeconds", "type": "integer", "label": "Hot-plug poll (seconds)", "min": 2, "max": 120, "step": 1, "defaultValue": 10 },
+      { "key": "showBatteryOnBar", "type": "boolean", "label": "Battery on the bar", "defaultValue": true, "description": "Show the battery percentage next to the icon while the keyboard is on the 2.4 GHz dongle or Bluetooth." },
+      { "key": "batteryPollSeconds", "type": "integer", "label": "Battery poll (seconds)", "min": 15, "max": 900, "step": 15, "defaultValue": 120, "description": "How often to ask a wireless keyboard for its battery level." }
     ]
   }
 }

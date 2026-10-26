@@ -69,7 +69,7 @@ control transfers.
 | `0x0b` | – | screen parameters (models with a display) | [driver] `SetScreenParam` |
 | `0x11` | – | reset, 1 byte | [community] |
 | – | `0x82` sub=1 | 6-byte model password | [community] |
-| – | `0x87` sub=2 | battery, byte 0 = percent | [community] |
+| – | `0x87` | battery: byte 0 = percent, byte 1 = flag (`0x11` on the cable) | [community] `ReadPower`; [observed] `64 11` on a real F75 plugged in, any `sub` |
 
 The vendor driver's `CDevG5KB` virtual functions line up with these:
 `SetMatrix/GetMatrix`, `SetLED/GetLED`, `SetMacro/GetMacro`, `SetGame/GetGame`
@@ -160,6 +160,40 @@ move it verbatim. Layout from `KB.ini` and the driver's
 `01 btn 01 00` for mouse buttons, `03 mode count id` for macros, layer 0 is
 the base layer and layer 1 the Fn layer. The entry at index 127 is
 `00 00 5A A5` **[driver]** (`CRC=1`).
+
+## Battery and link status over the dongle
+
+Three one-frame exchanges, observed on a real F75 **[observed]**:
+
+```
+-> 13 05 01 00 00 … 19            device info request
+<- 13 05 01 00 0a 03 00 00 00 00 cd 01 …   byte 4 fw, bytes 5-10 = KB.ini password 03 00 00 00 00 cd
+-> 13 4a 01 00 00 … 5e            status request (0x0a | 0x40)
+<- 13 4a 01 00 02 64 01 …         byte 5 = battery percent (0x64 = 100), byte 6 = 1
+<- 13 0a 01 00 04 05 64 01 …      unsolicited after key presses: byte 6 = percent, byte 7 = 1
+```
+
+Byte 2 is the link type the dongle reports (1 = 2.4 GHz). The flag after the
+percent is `0x01` on the dongle with no cable and `0x11` in the USB `0x87`
+reply with the cable in, so the plugin reads bit 4 as **charging**. A board
+that is asleep ignores the first request, so the plugin asks up to three
+times.
+
+Plugging the cable in while the board is on the dongle makes it enumerate
+on USB (vendor interface included) and stop answering the dongle, so "USB
+wins when enumerated" is also what the firmware does. The password in the `0x05` reply is the same
+six bytes the vendor driver checks with `GetPassword`, so it doubles as proof
+that the board on the other end of the dongle is an F75.
+
+### Which link is active
+
+The host can see three things without touching the board: the wired vendor
+interface (`258a:010c`, keyboard on the cable), the dongle (`3554:fa09`,
+plugged in, says nothing about the board) and a Bluetooth HID input device
+whose name looks like the F75 (with the kernel's `hid-*-battery` power supply
+when present). The active link is whichever transport answers: USB wins when
+its vendor interface is enumerated, otherwise the dongle when `0x4a` answers.
+Bluetooth is detection-only: the vendor protocol is not available over it.
 
 ## 2.4 GHz dongle framing
 
