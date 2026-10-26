@@ -2,3 +2,7 @@
 # to the vendor HID interface. Installed by the Omarchy AULA F75 plugin.
 KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"
+# ... and to its keyboard event node, so the plugin can toggle Caps/Num/Scroll
+# lock by tapping the key through evdev.
+KERNEL=="event*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"

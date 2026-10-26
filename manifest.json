@@ -5,14 +5,14 @@
   "version": "1.0.0",
   "author": "crucialjun",
   "license": "MIT",
-  "description": "Lighting, colour, sleep and debounce control for the AULA F75 keyboard over USB or the 2.4 GHz dongle, with optional theme-accent sync",
+  "description": "Lighting, colour, sleep, debounce and lock-key (Caps/Num/Scroll) control for the AULA F75 keyboard over USB or the 2.4 GHz dongle, with optional theme-accent sync",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
     "displayName": "AULA F75",
-    "description": "Keyboard lighting popup for the AULA F75",
+    "description": "Keyboard lighting and lock-key popup for the AULA F75",
     "category": "Hardware",
     "allowMultiple": false,
     "defaultSection": "right",

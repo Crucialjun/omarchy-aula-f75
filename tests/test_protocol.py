@@ -216,3 +216,41 @@ class Parsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostLocks(unittest.TestCase):
+    """The lock-key helpers that need no device."""
+
+    def test_keycodes_are_the_kernel_ones(self):
+        self.assertEqual(m.LOCK_KEYS["caps"][0], 58)    # KEY_CAPSLOCK
+        self.assertEqual(m.LOCK_KEYS["num"][0], 69)     # KEY_NUMLOCK
+        self.assertEqual(m.LOCK_KEYS["scroll"][0], 70)  # KEY_SCROLLLOCK
+
+    def test_aliases(self):
+        for alias, key in (("CapsLock", "caps"), ("num_lock", "num"), ("scrolllock", "scroll")):
+            self.assertEqual(m.LOCK_ALIASES.get(alias.lower(), alias.lower()), key)
+
+    def test_describe(self):
+        self.assertEqual(m.describe_locks({"available": False}), "n/a")
+        self.assertEqual(m.describe_locks({"available": True, "writable": True, "caps": True, "num": True}), "Caps, Num")
+        self.assertIn("read-only", m.describe_locks({"available": True, "writable": False}))
+
+    def test_udev_rule_covers_event_nodes_and_matches_shipped_file(self):
+        self.assertIn('KERNEL=="event*"', m.UDEV_RULE)
+        with open(os.path.join(HERE, "..", "udev", "60-aula-f75.rules"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), m.UDEV_RULE)
+
+
+class WinLock(unittest.TestCase):
+    """Byte 0x0f: observed flipping 00<->01 with Fn+Win on a real F75."""
+
+    def test_decode(self):
+        self.assertFalse(m.decode_led_block(m.TEMPLATE_LED_BLOCK)["winlock"])
+        b = bytearray(m.TEMPLATE_LED_BLOCK); b[0x0F] = 1
+        self.assertTrue(m.decode_led_block(bytes(b))["winlock"])
+
+    def test_patch_only_touches_0x0f(self):
+        out = m.patch_led_block(m.TEMPLATE_LED_BLOCK, winlock=True)
+        self.assertEqual(out[0x0F], 1)
+        self.assertEqual(bytes(out[:0x0F]) + bytes(out[0x10:]), m.TEMPLATE_LED_BLOCK[:0x0F] + m.TEMPLATE_LED_BLOCK[0x10:])
+        self.assertEqual(m.patch_led_block(out, winlock=False), m.TEMPLATE_LED_BLOCK)

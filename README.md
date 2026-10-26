@@ -10,12 +10,17 @@ protocol reverse engineered from the Windows driver and USB captures.
 - Bar icon with a popup: effect, brightness, speed, colour swatches (including
   the current theme's accent/text/urgent colours), colourful mode, sleep timer,
   debounce, lighting on/off.
+- **Lock keys** – the Win key lock (what Fn+Win toggles, read from and written
+  to the keyboard) plus live Caps/Num/Scroll Lock state (from the keyboard's
+  own indicator LEDs) with switches to toggle them, also on the bar tooltip
+  and over IPC. Keys `W`/`C`/`N`/`S` in the panel do the same.
 - **Theme sync** – when enabled, the keyboard is re-coloured every time you
   switch Omarchy themes.
 - Mouse shortcuts on the bar icon: left opens the panel, right toggles the
   lighting, middle applies the theme accent, wheel changes brightness.
 - IPC: `omarchy-shell crucialjun.aula-f75 effect rainbow`, `… brightness 5`,
-  `… colour '#ff8800'`, `… theme`, `… lightsToggle`, `… toggle`.
+  `… colour '#ff8800'`, `… theme`, `… lightsToggle`, `… winlock`, `… lock caps`,
+  `… toggle`.
 - A CLI (`bin/aula-f75`) that also does per-key colours, gradients, backup and
   restore of the keyboard's onboard settings, and raw protocol access.
 
@@ -31,11 +36,12 @@ omarchy plugin add https://github.com/crucialjun/omarchy-aula-f75.git --enable
 
 Then open the panel once and click **Grant access**: it installs a udev rule
 (`/etc/udev/rules.d/60-aula-f75.rules`, through polkit) so your user can
-talk to the keyboard's vendor HID interface. Equivalent by hand:
+talk to the keyboard's vendor HID interface and tap its lock keys through
+its event node. Equivalent by hand:
 
 ```bash
 sudo cp ~/.config/omarchy/plugins/crucialjun.aula-f75/udev/60-aula-f75.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=input
 ```
 
 Place the widget with `omarchy bar move crucialjun.aula-f75 --section right`
@@ -57,12 +63,22 @@ python3 $P colour '#ff8800'          # colour of the current effect
 python3 $P colorful on               # let the effect cycle colours
 python3 $P sleep 10                  # minutes, or off (wireless idle sleep)
 python3 $P debounce 2                # 1..4
+python3 $P winlock off               # Win key lock (Fn+Win): on | off | toggle
+python3 $P locks                     # Caps/Num/Scroll lock state
+python3 $P lock caps                 # toggle (or: lock num off, lock scroll on)
 python3 $P theme                     # apply the Omarchy theme accent
 python3 $P perkey --all '#202020' W=#ff0000 A=#ff0000 S=#ff0000 D=#ff0000
 python3 $P perkey --gradient '#ff0080' '#0080ff'
 python3 $P backup f75.json --matrix  # onboard lighting + key matrix, restorable
 python3 $P --json status             # what the widget consumes
+python3 $P watch                     # print settings-block bytes as they change
 ```
+
+`aula-f75 watch` is for protocol work: leave it running, press Fn combos on
+the board (Fn+Win for the Win lock, the OS-mode switch, …) and it prints the
+offsets that moved. Every `aula-f75` process takes a lock on the keyboard, so
+`watch` and the bar widget can coexist. That is how new settings get found; see
+[docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 `aula-f75 keys` lists the key names and LED indexes; `aula-f75 effects` the
 effects. Every write is a read-modify-write of the keyboard's own 128-byte

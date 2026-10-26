@@ -63,6 +63,7 @@ SIGNATURE = b"\x5a\xa5"
 # LED block offsets (see docs/PROTOCOL.md for the evidence behind each)
 OFF_DEBOUNCE = 0x03
 OFF_CUSTOM_FLAG = 0x09
+OFF_WINLOCK = 0x0F                # 1 while the Win key is locked (Fn+Win), else 0
 OFF_EFFECT = 0x0A
 OFF_SLEEP = 0x18
 OFF_EFFECT_TABLE = 0x38           # 2 bytes per effect id: brightness, speed<<4|colour
@@ -251,6 +252,106 @@ def pick_device(prefer=None, explicit=None):
 
 
 # --------------------------------------------------------------------------
+# Host-side lock keys (Caps / Num / Scroll)
+#
+# These are not in the vendor protocol: the host owns them. The kernel exposes
+# the state of the keyboard's own indicator LEDs under /sys/class/leds, and the
+# keyboard's evdev node accepts injected EV_KEY events, which is how the plugin
+# toggles them without a compositor-specific API.
+# --------------------------------------------------------------------------
+EV_SYN, EV_KEY = 0x00, 0x01
+LOCK_KEYS = {              # name -> (evdev keycode, sysfs LED suffix)
+    "caps": (58, "capslock"),
+    "num": (69, "numlock"),
+    "scroll": (70, "scrolllock"),
+}
+LOCK_ALIASES = {"capslock": "caps", "caps_lock": "caps", "numlock": "num", "num_lock": "num",
+                "scrolllock": "scroll", "scroll_lock": "scroll"}
+
+
+def usb_device_dir(hidraw_path):
+    """/dev/hidrawN -> the sysfs directory of the USB device it hangs off."""
+    node = "/sys/class/hidraw/" + os.path.basename(hidraw_path) + "/device"
+    d = os.path.realpath(node)
+    while d and d != "/":
+        if os.path.exists(os.path.join(d, "idVendor")):
+            return d
+        d = os.path.dirname(d)
+    return None
+
+
+def find_lock_input(hidraw_path):
+    """The keyboard's boot/keyboard input device (the one with LEDs) on the
+    same USB device as the vendor hidraw node. Returns (input_dir, event_path)
+    or (None, None)."""
+    usb = usb_device_dir(hidraw_path)
+    if not usb:
+        return None, None
+    for inp in sorted(glob.glob(os.path.join(usb, "*", "0003:*", "input", "input*"))):
+        try:
+            led = int(_read_sysfs(inp + "/capabilities/led", b"0").decode().strip() or "0", 16)
+        except ValueError:
+            led = 0
+        if not led:
+            continue
+        events = sorted(glob.glob(os.path.join(inp, "event*")))
+        return inp, ("/dev/input/" + os.path.basename(events[0])) if events else None
+    return None, None
+
+
+def read_locks(hidraw_path):
+    """{'available': bool, 'writable': bool, 'event': path, 'caps': bool, ...}"""
+    inp, event = find_lock_input(hidraw_path)
+    out = {"available": inp is not None, "event": event, "writable": False}
+    if inp is None:
+        return out
+    name = os.path.basename(inp)
+    for key, (_code, suffix) in LOCK_KEYS.items():
+        v = _read_sysfs("/sys/class/leds/%s::%s/brightness" % (name, suffix), b"").decode().strip()
+        out[key] = (v not in ("", "0"))
+    out["writable"] = bool(event) and os.access(event, os.W_OK)
+    return out
+
+
+def inject_key(event_path, keycode):
+    """Tap a key through the keyboard's own evdev node (press + release)."""
+    import struct
+    ev = struct.Struct("llHHi")  # struct input_event on 64-bit Linux
+    frames = b"".join(ev.pack(0, 0, t, c, v) for t, c, v in
+                      ((EV_KEY, keycode, 1), (EV_SYN, 0, 0), (EV_KEY, keycode, 0), (EV_SYN, 0, 0)))
+    try:
+        fd = os.open(event_path, os.O_WRONLY)
+    except PermissionError:
+        raise DeviceError("permission denied on %s (install the udev rule: aula-f75 udev)" % event_path)
+    except OSError as e:
+        raise DeviceError("cannot open %s: %s" % (event_path, e))
+    try:
+        os.write(fd, frames)
+    finally:
+        os.close(fd)
+
+
+def set_lock(hidraw_path, name, want=None):
+    """Toggle (want=None) or set a lock key; returns the new read_locks()."""
+    name = LOCK_ALIASES.get(name.lower(), name.lower())
+    if name not in LOCK_KEYS:
+        raise DeviceError("unknown lock key %r (caps, num, scroll)" % name)
+    locks = read_locks(hidraw_path)
+    if not locks["available"] or not locks["event"]:
+        raise DeviceError("no keyboard input device with lock LEDs found next to %s" % hidraw_path)
+    if want is None or locks.get(name) != want:
+        inject_key(locks["event"], LOCK_KEYS[name][0])
+        # The compositor flips the LED after it has seen the key; give it a moment.
+        for _ in range(10):
+            time.sleep(0.02)
+            now = read_locks(hidraw_path)
+            if now.get(name) != locks.get(name):
+                break
+        locks = now
+    return locks
+
+
+# --------------------------------------------------------------------------
 # Pure protocol functions (no I/O) - unit tested in tests/test_protocol.py
 # --------------------------------------------------------------------------
 def wired_header(cmd, sub, total, idx, size):
@@ -333,14 +434,17 @@ def decode_led_block(block):
         "sleep_hw": sleep_hw,
         "sleep_minutes": round(sleep_hw * 30 / 60, 1) if sleep_hw else 0,
         "debounce": block[OFF_DEBOUNCE],
+        "winlock": block[OFF_WINLOCK] == 1,
         "custom_flag": block[OFF_CUSTOM_FLAG],
         "signature_ok": check_signature(block, OFF_LED_SIG),
     }
 
 
 def patch_led_block(block, effect=None, brightness=None, speed=None, colour_index=None,
-                    sleep_hw=None, debounce=None):
+                    sleep_hw=None, debounce=None, winlock=None):
     out = bytearray(block)
+    if winlock is not None:
+        out[OFF_WINLOCK] = 1 if winlock else 0
     if effect is not None:
         if effect not in EFFECT_BY_ID:
             raise DeviceError("unknown effect id %d" % effect)
@@ -694,13 +798,77 @@ class WirelessTransport:
         raise DeviceError("reset over the 2.4 GHz dongle is not supported")
 
 
+LOCK_TIMEOUT = 6.0
+
+
+def lock_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(base, "aula-f75-%d.lock" % os.getuid())
+
+
+class DeviceLock:
+    """One conversation with the keyboard at a time, across processes.
+
+    The SinoWealth controller answers one feature-report exchange at a time;
+    if a second process slips a SET_FEATURE in between another's request and
+    its GET_FEATURE, the vendor endpoint stalls and the USB stack re-enumerates
+    the keyboard (seen on a real board). The widget serialises its own calls,
+    but the CLI, the widget's status poll and `watch` can overlap, so every
+    transport takes this flock for as long as it is open.
+    """
+
+    def __init__(self, timeout=LOCK_TIMEOUT):
+        self.timeout = timeout
+        self.fd = None
+
+    def acquire(self):
+        if fcntl is None:
+            return
+        self.fd = os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.time() >= deadline:
+                    os.close(self.fd)
+                    self.fd = None
+                    raise DeviceError("another aula-f75 is talking to the keyboard (lock %s)" % lock_path())
+                time.sleep(0.05)
+
+    def release(self):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
 def open_transport(args):
     dev = pick_device(prefer=args.transport, explicit=args.device)
     if dev is None:
         raise DeviceError("no AULA F75 found (wired 258a:010c or dongle 3554:fa09)")
     cls = WiredTransport if dev["transport"] == "wired" else WirelessTransport
-    t = cls(dev["path"], verbose=args.verbose, dry_run=args.dry_run)
+    lock = DeviceLock()
+    if not args.dry_run:
+        lock.acquire()
+    try:
+        t = cls(dev["path"], verbose=args.verbose, dry_run=args.dry_run)
+    except Exception:
+        lock.release()
+        raise
     t.info = dev
+    t.lock = lock
+    orig_close = t.close
+
+    def close():
+        try:
+            orig_close()
+        finally:
+            lock.release()
+    t.close = close
     return t
 
 
@@ -716,6 +884,7 @@ def status_dict(t, block, table=None):
         "name": t.info.get("name", ""),
         "brightness_max": BRIGHTNESS_MAX,
         "speed_max": SPEED_MAX,
+        "locks": read_locks(t.path),
     })
     if table is not None and st["effect"] in EFFECT_BY_ID and st["effect"] not in (0, EFFECT_CUSTOM):
         st["colour"] = colour_hex(read_rgb_slot(table, st["effect"], min(st["colour_index"], 6)))
@@ -736,7 +905,7 @@ def cmd_detect(args):
     devs = enumerate_devices()
     dev = pick_device(prefer=args.transport, explicit=args.device)
     data = {"connected": dev is not None, "devices": devs,
-            "selected": dev}
+            "selected": dev, "locks": read_locks(dev["path"]) if dev else {"available": False}}
     if args.json:
         emit(args, data)
     elif dev:
@@ -771,13 +940,15 @@ def cmd_status(args):
             print("Colour      : %s" % ("colourful" if st["colorful"] else st.get("colour", "slot %d" % st["colour_index"])))
         print("Sleep       : %s" % ("off" if not st["sleep_hw"] else "%g min" % st["sleep_minutes"]))
         print("Debounce    : %d" % st["debounce"])
+        print("Win lock    : %s" % ("on" if st["winlock"] else "off"))
+        print("Lock keys   : %s" % describe_locks(st["locks"]))
         if not st["signature_ok"]:
             print("warning: LED block signature missing; the read may be garbage", file=sys.stderr)
     return 0
 
 
 def apply_changes(args, effect=None, brightness=None, speed=None, colour=None, colorful=None,
-                  sleep_minutes=None, debounce=None):
+                  sleep_minutes=None, debounce=None, winlock=None):
     t = open_transport(args)
     try:
         block = t.read_led()
@@ -790,7 +961,8 @@ def apply_changes(args, effect=None, brightness=None, speed=None, colour=None, c
             colour_index = 0
         new_block = patch_led_block(block, effect=effect, brightness=brightness, speed=speed,
                                     colour_index=colour_index,
-                                    sleep_hw=sleep_hw_from_minutes(sleep_minutes), debounce=debounce)
+                                    sleep_hw=sleep_hw_from_minutes(sleep_minutes), debounce=debounce,
+                                    winlock=winlock)
         eff = new_block[OFF_EFFECT]
         if colour is not None and eff not in (0, EFFECT_CUSTOM):
             table = t.read_rgb_table()
@@ -814,7 +986,8 @@ def cmd_set(args):
                        effect=parse_effect(args.effect) if args.effect else None,
                        brightness=args.brightness, speed=args.speed, colour=args.colour,
                        colorful=(True if args.colorful == "on" else False if args.colorful == "off" else None),
-                       sleep_minutes=args.sleep, debounce=args.debounce)
+                       sleep_minutes=args.sleep, debounce=args.debounce,
+                       winlock=(True if args.winlock == "on" else False if args.winlock == "off" else None))
     emit(args, st, "ok: %s, brightness %d" % (st["effect_name"], st["brightness"]))
     return 0
 
@@ -858,6 +1031,22 @@ def cmd_sleep(args):
 def cmd_debounce(args):
     st = apply_changes(args, debounce=args.level)
     emit(args, st, "debounce: %d" % st["debounce"])
+    return 0
+
+
+def cmd_winlock(args):
+    """Win key lock (what Fn+Win toggles on the board), stored at 0x0f."""
+    want = None
+    if args.state == "toggle":
+        t = open_transport(args)
+        try:
+            want = not decode_led_block(t.read_led())["winlock"]
+        finally:
+            t.close()
+    else:
+        want = args.state == "on"
+    st = apply_changes(args, winlock=want)
+    emit(args, st, "win lock: %s" % ("on" if st["winlock"] else "off"))
     return 0
 
 
@@ -1050,6 +1239,10 @@ UDEV_RULE = """# AULA F75 keyboard (wired) and its 2.4 GHz dongle: let the logge
 # to the vendor HID interface. Installed by the Omarchy AULA F75 plugin.
 KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"
+# ... and to its keyboard event node, so the plugin can toggle Caps/Num/Scroll
+# lock by tapping the key through evdev.
+KERNEL=="event*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"
 """
 UDEV_PATH = "/etc/udev/rules.d/60-aula-f75.rules"
 
@@ -1076,8 +1269,81 @@ def cmd_udev(args):
         os.execvp("pkexec", ["pkexec", "/usr/bin/python3", script, "udev", "--install"])
     with open(UDEV_PATH, "w", encoding="utf-8") as fh:
         fh.write(UDEV_RULE)
-    os.system("udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw")
+    os.system("udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw --subsystem-match=input")
     print("installed %s" % UDEV_PATH)
+    return 0
+
+
+def describe_locks(locks):
+    if not locks or not locks.get("available"):
+        return "n/a"
+    on = [n for n in ("caps", "num", "scroll") if locks.get(n)]
+    text = ", ".join({"caps": "Caps", "num": "Num", "scroll": "Scroll"}[n] for n in on) or "none"
+    return text + ("" if locks.get("writable") else " (read-only: install the udev rule to toggle)")
+
+
+def _lock_device(args):
+    dev = pick_device(prefer=args.transport, explicit=args.device)
+    if dev is None:
+        raise DeviceError("no AULA F75 found (wired 258a:010c or dongle 3554:fa09)")
+    return dev
+
+
+def cmd_locks(args):
+    dev = _lock_device(args)
+    locks = read_locks(dev["path"])
+    emit(args, {"connected": True, "locks": locks}, describe_locks(locks))
+    return 0
+
+
+def cmd_lock(args):
+    dev = _lock_device(args)
+    want = None if args.state == "toggle" else (args.state == "on")
+    locks = set_lock(dev["path"], args.key, want)
+    emit(args, {"connected": True, "locks": locks}, describe_locks(locks))
+    return 0
+
+
+def cmd_watch(args):
+    """Poll the settings block and print every byte that changes.
+
+    Protocol discovery helper: run it, press Fn combos on the board (Fn+Win,
+    Fn+Q/W/A/S, ...) and see which offsets move.
+    """
+    def poll():
+        # Open, lock, read, close on every poll: holding the device for the
+        # whole run would shut the bar widget out (or, without the lock,
+        # interleave with it and stall the controller).
+        t = open_transport(args)
+        try:
+            return t.read_led()
+        finally:
+            t.close()
+
+    prev = poll()
+    print("baseline: " + prev.hex(" "), flush=True)
+    deadline = time.time() + args.seconds if args.seconds else None
+    failures = 0
+    try:
+        while deadline is None or time.time() < deadline:
+            time.sleep(args.interval)
+            try:
+                cur = poll()
+                failures = 0
+            except DeviceError as e:
+                failures += 1
+                print("read failed: %s" % e, file=sys.stderr, flush=True)
+                if failures >= 10:
+                    print("giving up: the keyboard went away", file=sys.stderr, flush=True)
+                    return 2
+                time.sleep(1.0)
+                continue
+            if cur != prev:
+                diffs = ["0x%02x: %02x->%02x" % (i, prev[i], cur[i]) for i in range(len(cur)) if cur[i] != prev[i]]
+                print("%s %s" % (time.strftime("%H:%M:%S"), ", ".join(diffs)), flush=True)
+                prev = cur
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
@@ -1102,6 +1368,7 @@ def build_parser():
     s.add_argument("--effect"); s.add_argument("--brightness", type=int); s.add_argument("--speed", type=int)
     s.add_argument("--colour", "--color", dest="colour"); s.add_argument("--colorful", choices=["on", "off"])
     s.add_argument("--sleep", help="minutes, or 'off'"); s.add_argument("--debounce", type=int)
+    s.add_argument("--winlock", choices=["on", "off"])
     s.set_defaults(func=cmd_set)
     s = sub.add_parser("effect", help="select a lighting effect by name or id"); s.add_argument("name"); s.set_defaults(func=cmd_effect)
     s = sub.add_parser("brightness", help="0..9"); s.add_argument("level", type=int); s.set_defaults(func=cmd_brightness)
@@ -1126,6 +1393,15 @@ def build_parser():
     s.add_argument("--read", type=lambda x: int(x, 0)); s.add_argument("--write", type=lambda x: int(x, 0))
     s.add_argument("--sub", type=lambda x: int(x, 0), default=0); s.add_argument("--size", type=lambda x: int(x, 0), default=LED_BLOCK_LEN)
     s.add_argument("--data", default=""); s.set_defaults(func=cmd_raw)
+    s = sub.add_parser("winlock", help="Win key lock (Fn+Win): on | off | toggle")
+    s.add_argument("state", nargs="?", choices=["on", "off", "toggle"], default="toggle"); s.set_defaults(func=cmd_winlock)
+    s = sub.add_parser("locks", help="state of Caps/Num/Scroll lock on the keyboard (host side)"); s.set_defaults(func=cmd_locks)
+    s = sub.add_parser("lock", help="toggle or set a lock key, e.g. lock caps / lock num off")
+    s.add_argument("key", help="caps | num | scroll"); s.add_argument("state", nargs="?", choices=["on", "off", "toggle"], default="toggle")
+    s.set_defaults(func=cmd_lock)
+    s = sub.add_parser("watch", help="poll the settings block and print bytes that change (protocol discovery)")
+    s.add_argument("--interval", type=float, default=0.5); s.add_argument("--seconds", type=float, default=0)
+    s.set_defaults(func=cmd_watch)
     s = sub.add_parser("reset", help="send the vendor reset command"); s.add_argument("--yes", action="store_true"); s.set_defaults(func=cmd_reset)
     s = sub.add_parser("udev", help="install (via pkexec) / check / print the udev rule")
     s.add_argument("--install", action="store_true"); s.add_argument("--check", action="store_true"); s.add_argument("--print", action="store_true")

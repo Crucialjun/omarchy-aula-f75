@@ -93,6 +93,7 @@ A block captured from a real board, vendor driver, effect "Fixed on":
 | `0x03` | debounce, 1..4 (vendor UI `ShowDebounce=0x04000101`) | [community] decompile; [driver] range |
 | `0x09` | `1` while the custom per-key effect is active, else `0` | [capture] only the self-define write sets it |
 | `0x0a` | **active effect id** | [capture] the only byte that differs between the 17 effect captures |
+| `0x0f` | **Win key lock**: `1` while Fn+Win has disabled the Win key, `0` otherwise | [observed] `aula-f75 watch` on a real F75: pressing Fn+Win flips exactly this byte (`00`↔`01`), and the board with `01` had its Super key dead |
 | `0x18` | sleep timer in 30 s units (`SleepHW`), `0` = never | [capture] wireless sleep capture patches byte 24; [driver] `SleepHW=2,3,4,6,8,10,20,30,40` ↔ `SleepUI=60…1200` s |
 | `0x38 + 2·id` | brightness for effect `id`, 0..9 | [capture] brightness capture patches `0x3a` with effect 1 active |
 | `0x39 + 2·id` | `speed << 4 \| colour`; speed 0..4, colour 0..6 picks one of the effect's seven table colours, 7 = colourful/random | [capture] `0x3b` flips `0x40`↔`0x47` with the "Colorful" switch; [driver] `Speed=0..4`, `Light=0..9` |
@@ -194,10 +195,48 @@ factory board but might differ on yours.
 The dongle has no interrupt OUT endpoint, so hidraw `write()` goes out as a
 SET_REPORT control transfer, which is exactly what the vendor driver does.
 
+## One talker at a time
+
+The controller handles one feature-report exchange at a time. If a second
+process sends a `SET_FEATURE` between another process's read request and its
+`GET_FEATURE`, the vendor endpoint stalls and the kernel re-enumerates the
+keyboard (observed twice on a real F75: `usb 3-4.3.3.3: USB disconnect` the
+moment the bar widget's status read overlapped a running `aula-f75 watch`).
+Every `aula-f75` invocation therefore holds an exclusive `flock` on
+`$XDG_RUNTIME_DIR/aula-f75-<uid>.lock` while its hidraw node is open, and
+`watch` reopens the device for each poll so the widget can get in between.
+
+## Host-side state: Caps / Num / Scroll lock
+
+These are not in the vendor protocol at all. The host owns the lock state and
+pushes it to the keyboard as standard HID output-report LEDs, which the kernel
+exposes under `/sys/class/leds/inputN::capslock|numlock|scrolllock` for the
+keyboard's boot/keyboard interface (the input device on the same USB device
+as the vendor `hidraw` node that has `capabilities/led != 0`). The plugin
+reads those files (no device I/O) and toggles a lock by writing an `EV_KEY`
+press/release of `KEY_CAPSLOCK`/`KEY_NUMLOCK`/`KEY_SCROLLLOCK` to the
+keyboard's own `/dev/input/eventN`, which the compositor sees as a real key
+press on that keyboard. Writing to the event node needs the extended udev rule
+(`KERNEL=="event*" … TAG+="uaccess"`).
+
+## Firmware toggles: Win lock (found), OS mode (open)
+
+Fn+Win (Win lock, white indicator) and the Windows/macOS mode switch are
+handled inside the firmware and stored in the `0x04` settings block. None of
+the public sources (vendor driver strings, captures, open-aula, leisiji,
+OpenLeobog) name the bytes, so they are found by watching: `aula-f75 watch`
+polls the block and prints every offset that changes.
+
+- **Win lock = `0x0f`.** Pressing Fn+Win while watching flipped only this
+  byte, `00` → `01`; writing it back through the normal read-modify-write
+  switches the lock from the host (`aula-f75 winlock on|off|toggle`).
+- OS mode is still open. `0x12` (02 ↔ 03) and `0x1b` (01 ↔ 02 ↔ 00 over one
+  session) differ between boards and over time and are the next candidates.
+
 ## What is *not* known
 
-- Meaning of lighting-block bytes `0x00`–`0x02`, `0x04`–`0x08`, `0x0b`–`0x17`,
-  `0x19`–`0x37` and `0x64`–`0x7d` (preserved verbatim).
+- Meaning of lighting-block bytes `0x00`–`0x02`, `0x04`–`0x08`, `0x0b`–`0x0e`,
+  `0x10`–`0x17`, `0x19`–`0x37` and `0x64`–`0x7d` (preserved verbatim).
 - Whether the hidden effects 9, 14, 18 exist in the F75 firmware.
 - Dongle commands for per-key colours, key matrix and macros.
 - The macro buffer layout (documented by open-aula, not needed here).

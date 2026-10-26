@@ -87,6 +87,10 @@ Panel {
         if (t === "t" || t === "T") root.kb.applyTheme()
         else if (t === "o" || t === "O") root.kb.toggleLighting()
         else if (t === "r" || t === "R") root.kb.refresh()
+        else if (t === "w" || t === "W") root.kb.toggleWinLock()
+        else if (t === "c" || t === "C") root.kb.toggleLock("caps")
+        else if (t === "n" || t === "N") root.kb.toggleLock("num")
+        else if (t === "s" || t === "S") root.kb.toggleLock("scroll")
       }
 
       Column {
@@ -310,6 +314,72 @@ Panel {
             options: Model.DEBOUNCE_OPTIONS
             value: root.hasStatus ? String(root.status.debounce) : ""
             onChanged: function(v) { if (root.kb && v !== "" && String(root.status.debounce) !== v) root.kb.setDebounce(parseInt(v)) }
+          }
+        }
+
+        // ---- Lock keys ------------------------------------------------
+        Column {
+          width: parent.width
+          spacing: Style.spacing.labelGap
+          visible: root.connected && (root.hasStatus || (root.kb && root.kb.locksAvailable === true))
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+          PanelSectionHeader { text: "Lock keys"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+          Column {
+            width: parent.width
+            spacing: Style.spacing.controlGap
+
+            // Firmware side: what Fn+Win toggles. Lives in the keyboard's
+            // settings block, so it needs no udev rule beyond the HID one.
+            Toggle {
+              width: parent.width
+              label: "Win key lock"
+              description: root.hasStatus && root.status.winlock === true
+                ? "On · the Win key is disabled (Fn+Win)"
+                : "Off · the Win key works normally (Fn+Win)"
+              checked: root.hasStatus && root.status.winlock === true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: root.hasStatus && !root.busy
+              onClicked: if (root.kb) root.kb.setWinLock(!checked)
+            }
+
+            Repeater {
+              model: Model.LOCK_KEYS
+
+              Toggle {
+                required property var modelData
+                readonly property bool on: root.kb && root.kb.locks ? root.kb.locks[modelData.key] === true : false
+                width: parent.width
+                label: modelData.full
+                description: on ? "On" : "Off"
+                checked: on
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: root.kb && root.kb.locksWritable === true && !root.busy
+                opacity: enabled ? 1.0 : 0.6
+                onClicked: if (root.kb) root.kb.toggleLock(modelData.key)
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: root.kb && root.kb.locksWritable !== true && !root.permissionDenied
+            wrapMode: Text.WordWrap
+            text: "Shown live from the keyboard's indicator LEDs. To toggle them from here, grant access once (installs a udev rule for the keyboard's event node)."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Button {
+            visible: root.kb && root.kb.locksWritable !== true && !root.permissionDenied
+            text: "Grant access"
+            iconText: "󰌾"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: if (root.kb) root.kb.installUdev()
           }
         }
 

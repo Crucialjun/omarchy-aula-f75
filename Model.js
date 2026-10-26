@@ -82,3 +82,18 @@ function describe(status) {
   if (status.has_colour) parts.push(status.colorful ? "colourful" : (status.colour || "colour slot " + status.colour_index))
   return parts.join(" · ")
 }
+
+var LOCK_KEYS = [
+  { key: "caps", label: "Caps", full: "Caps Lock" },
+  { key: "num", label: "Num", full: "Num Lock" },
+  { key: "scroll", label: "Scroll", full: "Scroll Lock" }
+]
+
+// " · Caps Lock · Num Lock" for the locks that are on, "" when none / unknown.
+function describeLocks(locks, sep) {
+  if (!locks || locks.available !== true) return ""
+  var out = ""
+  for (var i = 0; i < LOCK_KEYS.length; i++)
+    if (locks[LOCK_KEYS[i].key] === true) out += (sep || " · ") + LOCK_KEYS[i].full
+  return out
+}

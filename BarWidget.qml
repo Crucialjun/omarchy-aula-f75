@@ -33,6 +33,8 @@ BarWidget {
   property string transport: ""
   property string devicePath: ""
   property var status: ({})
+  // Caps/Num/Scroll lock, as the kernel reports the keyboard's own LEDs.
+  property var locks: ({})
   property bool busy: false
   property string lastError: ""
   property bool permissionDenied: false
@@ -45,6 +47,9 @@ BarWidget {
 
   readonly property string effectName: status && status.effect_name ? status.effect_name : ""
   readonly property bool lightingOff: status && status.effect === 0
+  readonly property bool winLocked: status && status.winlock === true
+  readonly property bool locksAvailable: locks && locks.available === true
+  readonly property bool locksWritable: locks && locks.writable === true
   readonly property bool shown: connected || !hideWhenDisconnected
 
   // ---- Commands -------------------------------------------------------
@@ -81,6 +86,7 @@ BarWidget {
   }
 
   function absorb(parsed, stderrText) {
+    if (parsed && parsed.locks) root.locks = parsed.locks
     if (parsed && parsed.connected === false) {
       root.lastError = String(parsed.error || "device error")
       root.permissionDenied = /permission denied/i.test(root.lastError)
@@ -110,6 +116,17 @@ BarWidget {
   function setDebounce(level) { run(["debounce", String(level)]) }
   function applyTheme() { run(["theme", Model.hexColor(Commons.Color.accent)]) }
   function installUdev() { run(["udev"]) }
+  function setWinLock(on) { run(["winlock", on ? "on" : "off"]) }
+  function toggleWinLock() { run(["winlock", "toggle"]) }
+  function setLock(key, on) { run(["lock", String(key), on ? "on" : "off"]) }
+  function toggleLock(key) { run(["lock", String(key), "toggle"]) }
+
+  // Cheap sysfs read, no device I/O: safe to poll while the panel is open.
+  function refreshLocks() {
+    if (!root.connected || locksProc.running || actionProc.running) return
+    locksProc.command = root.cliBase.concat(["locks"])
+    locksProc.running = true
+  }
 
   function toggleLighting() {
     if (!root.connected) return
@@ -137,6 +154,7 @@ BarWidget {
       if (themeSync) applyTheme()
     } else {
       root.status = ({})
+      root.locks = ({})
     }
   }
 
@@ -155,6 +173,7 @@ BarWidget {
       root.connected = !!(parsed.connected && sel)
       root.transport = sel ? String(sel.transport) : ""
       root.devicePath = sel ? String(sel.path) : ""
+      root.locks = parsed.locks || ({})
       if (root.connected && !was) root.refresh()
     }
   }
@@ -185,8 +204,31 @@ BarWidget {
       if (root.queue.length > 0) root.pump()
       // No status came back (udev install, or a failure): read the board
       // again so the panel shows what it is really doing now.
-      else if (!parsed || parsed.effect === undefined) root.refresh()
+      else if (!parsed || (parsed.effect === undefined && parsed.locks === undefined)) root.refresh()
     }
+  }
+
+  Process {
+    id: locksProc
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root._locksOut = text }
+    onExited: function(exitCode) {
+      var parsed = Model.parseJson(root._locksOut)
+      root._locksOut = ""
+      if (parsed && parsed.locks) root.locks = parsed.locks
+    }
+  }
+  property string _locksOut: ""
+
+  // Lock keys change under the user's fingers, so while the panel is open
+  // follow them closely (sysfs only, the keyboard is not touched).
+  Timer {
+    interval: 1000
+    running: root.opened && root.connected
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshLocks()
   }
 
   Timer {
@@ -244,6 +286,8 @@ BarWidget {
     function colour(hex: string): void { root.setColour(hex) }
     function theme(): void { root.applyTheme() }
     function lightsToggle(): void { root.toggleLighting() }
+    function lock(key: string): void { root.toggleLock(key) }
+    function winlock(): void { root.toggleWinLock() }
   }
 
   readonly property real openPanelIndicatorWidth: button.labelWidth
@@ -256,7 +300,7 @@ BarWidget {
     text: "󰌌"
     dimmed: !root.connected || root.lightingOff
     tooltipText: root.connected
-      ? "AULA F75 · " + (root.effectName || "…") + (root.transport === "wireless" ? " (2.4 GHz)" : "")
+      ? "AULA F75 · " + (root.effectName || "…") + (root.transport === "wireless" ? " (2.4 GHz)" : "") + (root.winLocked ? " · Win locked" : "") + Model.describeLocks(root.locks, " · ")
       : "AULA F75 not connected"
 
     onPressed: function(b) {
